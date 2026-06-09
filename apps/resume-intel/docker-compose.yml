@@ -2,6 +2,8 @@ services:
   backend:
     build:
       context: ./backend
+    env_file:
+      - ../../.env
     environment:
       DATABASE_PATH: /app/data/resume_intel.sqlite3
       CV_TYPES_DIR: /workspace/output/cv_types

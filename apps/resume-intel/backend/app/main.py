@@ -6,6 +6,10 @@ import json
 import os
 import re
 import sqlite3
+import secrets
+import urllib.error
+import urllib.parse
+import urllib.request
 from collections import Counter
 from datetime import datetime, timezone
 from email import message_from_bytes
@@ -17,12 +21,33 @@ from typing import Any
 
 from fastapi import FastAPI, File, Form, HTTPException, UploadFile
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import HTMLResponse, RedirectResponse
 from pydantic import BaseModel
 
+
+def load_local_env() -> None:
+    candidates = [Path.cwd() / ".env"]
+    candidates.extend(parent / ".env" for parent in Path(__file__).resolve().parents)
+    for env_path in candidates:
+        if not env_path.exists():
+            continue
+        for line in env_path.read_text(encoding="utf-8").splitlines():
+            stripped = line.strip()
+            if not stripped or stripped.startswith("#") or "=" not in stripped:
+                continue
+            key, value = stripped.split("=", 1)
+            os.environ.setdefault(key.strip(), value.strip().strip('"').strip("'"))
+        return
+
+
+load_local_env()
 
 DATABASE_PATH = Path(os.getenv("DATABASE_PATH", "/app/data/resume_intel.sqlite3"))
 CV_TYPES_DIR = Path(os.getenv("CV_TYPES_DIR", "/workspace/output/cv_types"))
 HH_RESUMES_PATH = Path(os.getenv("HH_RESUMES_PATH", "/app/config/hh_resumes.json"))
+LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
+LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
+LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
 
 STOPWORDS = {
     "для",
@@ -116,6 +141,18 @@ def connect() -> sqlite3.Connection:
     return conn
 
 
+def getenv_any(*names: str, default: str = "") -> str:
+    for name in names:
+        value = os.getenv(name)
+        if value:
+            return value
+    return default
+
+
+def utc_now() -> str:
+    return datetime.now(timezone.utc).isoformat()
+
+
 def init_db() -> None:
     with connect() as conn:
         conn.execute(
@@ -145,6 +182,30 @@ def init_db() -> None:
                 title TEXT NOT NULL,
                 url TEXT,
                 description TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_accounts (
+                channel TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                profile_id TEXT,
+                name TEXT,
+                email TEXT,
+                picture_url TEXT,
+                profile_url TEXT,
+                raw_profile TEXT NOT NULL
+            )
+            """
+        )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS oauth_states (
+                state TEXT PRIMARY KEY,
+                channel TEXT NOT NULL,
+                created_at TEXT NOT NULL
             )
             """
         )
@@ -1056,9 +1117,189 @@ def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     return event
 
 
+def linkedin_config() -> dict[str, Any]:
+    client_id = getenv_any("LINKEDIN_CLIENT_ID", "linkedin_client_id")
+    client_secret = getenv_any("LINKEDIN_CLIENT_SECRET", "linkedin_client_secret")
+    redirect_uri = getenv_any(
+        "LINKEDIN_REDIRECT_URI",
+        "linkedin_redirect_uri",
+        default="http://localhost:8787/api/channels/linkedin/oauth/callback",
+    )
+    scopes = getenv_any("LINKEDIN_SCOPES", "linkedin_scopes", default="openid profile email")
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "scopes": scopes,
+        "configured": bool(client_id and client_secret and redirect_uri),
+    }
+
+
+def latest_linkedin_account() -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM channel_accounts WHERE channel = ?", ("linkedin",)).fetchone()
+    if row is None:
+        return None
+    account = dict(row)
+    account.pop("raw_profile", None)
+    return account
+
+
+def request_json(url: str, *, data: dict[str, str] | None = None, access_token: str | None = None) -> dict[str, Any]:
+    headers = {"Accept": "application/json"}
+    payload = None
+    if data is not None:
+        payload = urllib.parse.urlencode(data).encode("utf-8")
+        headers["Content-Type"] = "application/x-www-form-urlencoded"
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    request = urllib.request.Request(url, data=payload, headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        detail = exc.read().decode("utf-8", errors="replace")
+        raise HTTPException(status_code=502, detail=f"LinkedIn API error: {detail}") from exc
+    except urllib.error.URLError as exc:
+        raise HTTPException(status_code=502, detail=f"LinkedIn API unavailable: {exc}") from exc
+    return json.loads(body)
+
+
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/channels/linkedin/status")
+def linkedin_status() -> dict[str, Any]:
+    config = linkedin_config()
+    account = latest_linkedin_account()
+    return {
+        "channel": "linkedin",
+        "configured": config["configured"],
+        "missing": [
+            name
+            for name, value in {
+                "LINKEDIN_CLIENT_ID": config["client_id"],
+                "LINKEDIN_CLIENT_SECRET": config["client_secret"],
+                "LINKEDIN_REDIRECT_URI": config["redirect_uri"],
+            }.items()
+            if not value
+        ],
+        "redirect_uri": config["redirect_uri"],
+        "scopes": config["scopes"],
+        "connected": account is not None,
+        "account": account,
+    }
+
+
+@app.get("/api/channels/linkedin/connect")
+def linkedin_connect() -> RedirectResponse:
+    config = linkedin_config()
+    if not config["configured"]:
+        raise HTTPException(status_code=400, detail="LinkedIn OAuth не настроен: нужны client id, client secret и redirect uri")
+
+    state = secrets.token_urlsafe(32)
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO oauth_states (state, channel, created_at) VALUES (?, ?, ?)",
+            (state, "linkedin", utc_now()),
+        )
+
+    query = urllib.parse.urlencode(
+        {
+            "response_type": "code",
+            "client_id": config["client_id"],
+            "redirect_uri": config["redirect_uri"],
+            "scope": config["scopes"],
+            "state": state,
+        }
+    )
+    return RedirectResponse(f"{LINKEDIN_AUTH_URL}?{query}")
+
+
+@app.get("/api/channels/linkedin/oauth/callback", response_class=HTMLResponse)
+def linkedin_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+) -> HTMLResponse:
+    if error:
+        message = html.escape(error_description or error)
+        return HTMLResponse(f"<h1>LinkedIn connection failed</h1><p>{message}</p>", status_code=400)
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="LinkedIn не вернул code/state")
+
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM oauth_states WHERE state = ? AND channel = ?", (state, "linkedin")).fetchone()
+        if row is None:
+            raise HTTPException(status_code=400, detail="Некорректный OAuth state")
+        conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+
+    config = linkedin_config()
+    token_response = request_json(
+        LINKEDIN_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": config["redirect_uri"],
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+        },
+    )
+    access_token = token_response.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=502, detail="LinkedIn не вернул access_token")
+
+    profile = request_json(LINKEDIN_USERINFO_URL, access_token=str(access_token))
+    now = utc_now()
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO channel_accounts (
+                channel, created_at, updated_at, profile_id, name, email,
+                picture_url, profile_url, raw_profile
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                profile_id = excluded.profile_id,
+                name = excluded.name,
+                email = excluded.email,
+                picture_url = excluded.picture_url,
+                profile_url = excluded.profile_url,
+                raw_profile = excluded.raw_profile
+            """,
+            (
+                "linkedin",
+                now,
+                now,
+                str(profile.get("sub", "")),
+                str(profile.get("name", "")),
+                str(profile.get("email", "")),
+                str(profile.get("picture", "")),
+                str(profile.get("profile", "")),
+                json.dumps(profile, ensure_ascii=False),
+            ),
+        )
+
+    safe_name = html.escape(str(profile.get("name") or "LinkedIn profile"))
+    return HTMLResponse(
+        f"""
+        <!doctype html>
+        <html lang="ru">
+        <head><meta charset="utf-8"><title>LinkedIn подключён</title></head>
+        <body>
+          <h1>LinkedIn подключён</h1>
+          <p>Профиль сохранён: {safe_name}</p>
+          <p>Можно закрыть это окно и вернуться в Resume Intel.</p>
+          <p><a href="http://localhost:5177">Вернуться в приложение</a></p>
+        </body>
+        </html>
+        """
+    )
 
 
 @app.get("/api/cv-types")

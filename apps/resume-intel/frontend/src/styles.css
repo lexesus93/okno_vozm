@@ -77,6 +77,12 @@ button:hover,
   transform: translateY(-1px);
 }
 
+button:disabled {
+  cursor: not-allowed;
+  opacity: 0.55;
+  transform: none;
+}
+
 .secondary {
   background: #e9f0ff;
   color: #1e63ff;
@@ -531,6 +537,12 @@ button:hover,
   border: 1px solid #e2e8f2;
   border-radius: 18px;
   padding: 16px;
+}
+
+.channel-actions {
+  display: grid;
+  gap: 10px;
+  margin-top: 12px;
 }
 
 pre {

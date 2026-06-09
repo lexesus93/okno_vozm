@@ -970,6 +970,32 @@ function ResumesPage({ hhResumes, cvTypes, onImported }) {
 }
 
 function ChannelsPage() {
+  const [linkedinStatus, setLinkedinStatus] = useState(null);
+  const [linkedinError, setLinkedinError] = useState('');
+
+  useEffect(() => {
+    let isMounted = true;
+    api('/api/channels/linkedin/status')
+      .then((status) => {
+        if (isMounted) {
+          setLinkedinStatus(status);
+          setLinkedinError('');
+        }
+      })
+      .catch((error) => {
+        if (isMounted) {
+          setLinkedinError(error.message);
+        }
+      });
+    return () => {
+      isMounted = false;
+    };
+  }, []);
+
+  function connectLinkedIn() {
+    window.location.href = `${API_BASE}/api/channels/linkedin/connect`;
+  }
+
   const channels = [
     {
       title: 'HH',
@@ -983,8 +1009,9 @@ function ChannelsPage() {
     },
     {
       title: 'LinkedIn',
-      status: 'запланировано',
-      description: 'Импорт сигналов, сообщений и вакансий там, где это технически и юридически допустимо.',
+      status: linkedinStatus?.connected ? 'подключён' : 'OAuth готовится',
+      description: 'OpenID Connect для базового профиля, ручной импорт вакансий и локальный трекинг откликов без Talent API.',
+      linkedin: true,
     },
     {
       title: 'Другие источники',
@@ -1002,9 +1029,30 @@ function ChannelsPage() {
           <div className="channel-card" key={channel.title}>
             <div className="match-row">
               <strong>{channel.title}</strong>
-              <Pill tone={channel.title === 'HH' ? 'blue' : 'default'}>{channel.status}</Pill>
+              <Pill tone={channel.title === 'HH' || (channel.linkedin && linkedinStatus?.connected) ? 'blue' : 'default'}>
+                {channel.status}
+              </Pill>
             </div>
             <p className="muted">{channel.description}</p>
+            {channel.linkedin && (
+              <div className="channel-actions">
+                {linkedinError && <p className="muted">Не удалось проверить LinkedIn: {linkedinError}</p>}
+                {linkedinStatus && !linkedinStatus.configured && (
+                  <p className="muted">
+                    Не хватает переменных: {linkedinStatus.missing.join(', ')}. Redirect URI: {linkedinStatus.redirect_uri}
+                  </p>
+                )}
+                {linkedinStatus?.connected && (
+                  <p className="muted">
+                    Профиль: <strong>{linkedinStatus.account?.name || 'LinkedIn'}</strong>
+                    {linkedinStatus.account?.email ? ` · ${linkedinStatus.account.email}` : ''}
+                  </p>
+                )}
+                <button type="button" onClick={connectLinkedIn} disabled={!linkedinStatus?.configured}>
+                  {linkedinStatus?.connected ? 'Переподключить LinkedIn' : 'Подключить LinkedIn'}
+                </button>
+              </div>
+            )}
           </div>
         ))}
       </div>
