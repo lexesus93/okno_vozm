@@ -1,0 +1,30 @@
+services:
+  backend:
+    build:
+      context: ./backend
+    environment:
+      DATABASE_PATH: /app/data/resume_intel.sqlite3
+      CV_TYPES_DIR: /workspace/output/cv_types
+      HH_RESUMES_PATH: /app/config/hh_resumes.json
+    volumes:
+      - ./backend/app:/app/app
+      - ./data:/app/data
+      - ./config:/app/config
+      - ../../output:/workspace/output:ro
+    ports:
+      - "8787:8787"
+
+  frontend:
+    build:
+      context: ./frontend
+    environment:
+      VITE_API_BASE: http://localhost:8787
+    volumes:
+      - ./frontend/src:/app/src
+      - ./frontend/index.html:/app/index.html
+      - ./frontend/package.json:/app/package.json
+      - ./frontend/vite.config.js:/app/vite.config.js
+    ports:
+      - "5177:5177"
+    depends_on:
+      - backend
