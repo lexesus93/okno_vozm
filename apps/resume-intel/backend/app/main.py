@@ -404,7 +404,7 @@ def split_markdown_sections(content: str) -> list[dict[str, Any]]:
 def extract_bullets(content: str) -> list[str]:
     bullets = []
     for line in content.splitlines():
-        match = re.match(r"^\s*[-*]\s+(.+)$", line)
+        match = re.match(r"^\s*[-*•]\s+(.+)$", line)
         if match:
             bullets.append(normalize_entity(match.group(1)))
     return bullets
@@ -476,6 +476,69 @@ def split_plain_resume_sections(text: str) -> dict[str, str]:
             continue
 
     return {key: normalize_text("\n".join(lines)) for key, lines in sections.items() if lines}
+
+
+def clean_linkedin_pdf_text(text: str) -> str:
+    text = re.sub(r"(?m)^\s*Page\s+\d+\s+of\s+\d+\s*$", "", text)
+    text = re.sub(r"(?m)^ \s*$", "", text)
+    text = re.sub(r"([A-Za-zА-Яа-яЁё])- *\n([A-Za-zА-Яа-яЁё])", r"\1-\2", text)
+    return normalize_text(text)
+
+
+def split_linkedin_resume_sections(text: str) -> dict[str, str]:
+    aliases = {
+        "contact": ["способы связаться", "contact"],
+        "skills": ["основные навыки", "top skills"],
+        "languages": ["languages", "языки"],
+        "certifications": ["certifications", "лицензии и сертификаты", "сертификаты"],
+        "summary": ["общие сведения", "about"],
+        "experience": ["опыт работы", "experience"],
+        "education": ["образование", "education"],
+    }
+    line_to_key: dict[str, str] = {}
+    for key, names in aliases.items():
+        for name in names:
+            line_to_key[name] = key
+
+    sections: dict[str, list[str]] = {"header": []}
+    current = "header"
+    for line in compact_lines(clean_linkedin_pdf_text(text)):
+        normalized = line.lower().strip(" .:")
+        key = line_to_key.get(normalized)
+        if key:
+            current = key
+            sections.setdefault(current, [])
+            continue
+        sections.setdefault(current, []).append(line)
+
+    return {key: normalize_text("\n".join(lines)) for key, lines in sections.items() if lines}
+
+
+def extract_linkedin_identity(text: str) -> dict[str, str]:
+    lines = compact_lines(clean_linkedin_pdf_text(text))
+    summary_idx = next((idx for idx, line in enumerate(lines) if line.lower().strip(" .:") in {"общие сведения", "about"}), -1)
+    if summary_idx < 0:
+        return {"name": "", "headline": "", "location": ""}
+
+    start_idx = max(0, summary_idx - 10)
+    candidates = lines[start_idx:summary_idx]
+    name_idx = -1
+    for idx, line in enumerate(candidates):
+        if re.fullmatch(r"[A-ZА-ЯЁ][A-Za-zА-Яа-яЁё.-]+ [A-ZА-ЯЁ][A-Za-zА-Яа-яЁё.-]+(?: [A-ZА-ЯЁ][A-Za-zА-Яа-яЁё.-]+)?", line):
+            name_idx = idx
+            break
+    if name_idx < 0:
+        return {"name": "", "headline": "", "location": ""}
+
+    name = normalize_entity(candidates[name_idx])
+    after_name = candidates[name_idx + 1:]
+    location = after_name[-1] if after_name else ""
+    headline_lines = after_name[:-1] if len(after_name) > 1 else after_name
+    return {
+        "name": name,
+        "headline": normalize_text(" ".join(headline_lines)),
+        "location": normalize_entity(location),
+    }
 
 
 def split_skills(value: str) -> list[str]:
@@ -578,6 +641,104 @@ def parse_experience_entries(experience_text: str) -> list[dict[str, Any]]:
     return entries
 
 
+def looks_like_location(line: str) -> bool:
+    lowered = line.lower()
+    return (
+        "," in line
+        and any(value in lowered for value in ["россия", "russia", "москва", "moscow", "санкт-петербург"])
+        and len(line) <= 80
+    )
+
+
+def linkedin_experience_header_start(lines: list[str], period_idx: int) -> int:
+    cursor = period_idx - 1
+    header_start = cursor
+    while cursor >= 0 and period_idx - cursor <= 4:
+        line = lines[cursor].strip()
+        if not line:
+            break
+        if line.startswith(("-", "•", "*")):
+            break
+        if cursor < period_idx - 1 and re.search(r"[.!?]$", line):
+            break
+        header_start = cursor
+        cursor -= 1
+    return header_start
+
+
+def parse_linkedin_experience_entries(experience_text: str) -> list[dict[str, Any]]:
+    lines = compact_lines(experience_text)
+    period_indexes = [idx for idx, line in enumerate(lines) if looks_like_period(line)]
+    if not period_indexes:
+        return parse_experience_entries(experience_text)
+
+    header_starts = [linkedin_experience_header_start(lines, idx) for idx in period_indexes]
+    entries: list[dict[str, Any]] = []
+    for order, period_idx in enumerate(period_indexes):
+        header_start = header_starts[order]
+        header_lines = lines[header_start:period_idx]
+        company = normalize_entity(header_lines[0]) if header_lines else ""
+        position = normalize_entity(" ".join(header_lines[1:])) if len(header_lines) > 1 else ""
+
+        body_start = period_idx + 1
+        if body_start < len(lines) and looks_like_location(lines[body_start]):
+            body_start += 1
+        body_end = header_starts[order + 1] if order + 1 < len(header_starts) else len(lines)
+        description = normalize_text("\n".join(lines[body_start:body_end]))
+
+        entries.append(
+            {
+                "period": normalize_entity(lines[period_idx]),
+                "company": company,
+                "position": position,
+                "description": description,
+                "achievements": extract_bullets(description),
+            }
+        )
+    return entries
+
+
+def parse_linkedin_resume_structure(text: str, title: str) -> dict[str, Any]:
+    cleaned_text = clean_linkedin_pdf_text(text)
+    sections = split_linkedin_resume_sections(cleaned_text)
+    identity = extract_linkedin_identity(cleaned_text)
+    profile_title = title
+    if identity.get("name"):
+        profile_title = identity["name"]
+        if identity.get("headline"):
+            profile_title = f"{profile_title} — {identity['headline']}"
+
+    header_lines = [
+        value
+        for value in [
+            identity.get("name", ""),
+            identity.get("headline", ""),
+            identity.get("location", ""),
+        ]
+        if value
+    ]
+    header_lines.extend(compact_lines(sections.get("contact", ""))[:6])
+
+    return {
+        "title": profile_title,
+        "header": header_lines[:12],
+        "summary": sections.get("summary", ""),
+        "skills": split_skills(sections.get("skills", "")),
+        "experience": parse_linkedin_experience_entries(sections.get("experience", "")),
+        "education": compact_lines(sections.get("education", "")),
+        "certifications": compact_lines(sections.get("certifications", "")),
+        "languages": compact_lines(sections.get("languages", "")),
+        "sections": [
+            {"key": key, "title": key, "content": value}
+            for key, value in sections.items()
+            if key != "header" and value
+        ],
+        "parser_notes": [
+            "LinkedIn PDF разобран по типовым заголовкам профиля; исходный текст сохранен полностью в raw_text.",
+        ],
+    }
+
+
 def parse_resume_structure(text: str, title: str) -> dict[str, Any]:
     sections = split_plain_resume_sections(text)
     header_lines = compact_lines(sections.get("header", ""))[:12]
@@ -606,6 +767,12 @@ def parse_resume_structure(text: str, title: str) -> dict[str, Any]:
             "Эвристический разбор по заголовкам и периодам; исходный текст сохранен полностью в raw_text.",
         ],
     }
+
+
+def parse_resume_for_channel(channel: str, text: str, title: str) -> dict[str, Any]:
+    if channel == "linkedin":
+        return parse_linkedin_resume_structure(text, title)
+    return parse_resume_structure(text, title)
 
 
 def detect_source(subject: str, sender: str, text: str) -> str:
@@ -994,7 +1161,8 @@ def hh_resume_detail_payload(item: dict[str, Any]) -> dict[str, Any]:
         str(item.get(key, ""))
         for key in ["title", "keywords", "raw_text"]
     )
-    parsed_structure = item.get("parsed_structure") or parse_resume_structure(
+    parsed_structure = item.get("parsed_structure") or parse_resume_for_channel(
+        str(item.get("channel", "hh")),
         str(item.get("raw_text", "")),
         str(item.get("title", "")),
     )
@@ -1290,11 +1458,21 @@ def linkedin_oauth_callback(
         f"""
         <!doctype html>
         <html lang="ru">
-        <head><meta charset="utf-8"><title>LinkedIn подключён</title></head>
+        <head>
+          <meta charset="utf-8">
+          <title>LinkedIn подключён</title>
+          <script>
+            setTimeout(() => {{
+              if (window.opener) {{
+                window.close();
+              }}
+            }}, 2500);
+          </script>
+        </head>
         <body>
           <h1>LinkedIn подключён</h1>
           <p>Профиль сохранён: {safe_name}</p>
-          <p>Можно закрыть это окно и вернуться в Resume Intel.</p>
+          <p>Данные сохранены локально в Resume Intel. Можно закрыть это окно и вернуться на вкладку "Каналы".</p>
           <p><a href="http://localhost:5177">Вернуться в приложение</a></p>
         </body>
         </html>
@@ -1349,6 +1527,32 @@ def hh_resume_detail(resume_id: str) -> dict[str, Any]:
     return hh_resume_detail_payload(item)
 
 
+@app.post("/api/hh-resumes/{resume_id}/reparse")
+def reparse_hh_resume(resume_id: str) -> dict[str, Any]:
+    item = find_hh_resume_by_id(resume_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Резюме не найдено")
+
+    raw_text = str(item.get("raw_text", ""))
+    if not raw_text:
+        raise HTTPException(status_code=400, detail="У резюме нет сохранённого raw_text для повторного разбора")
+
+    channel = str(item.get("channel", "hh"))
+    parsed_structure = parse_resume_for_channel(channel, raw_text, str(item.get("title", "")))
+    title = str(parsed_structure.get("title", "")).strip() or str(item.get("title", "")).strip()
+    now = utc_now()
+    updated = {
+        **item,
+        "title": title,
+        "keywords": " ".join(resume_keywords(item, parsed_structure, raw_text, 120)),
+        "parsed_structure": parsed_structure,
+        "updated_at": now,
+        "notes": f"{item.get('notes', '')}\nПовторно разобрано {now}".strip(),
+    }
+    save_hh_resume(updated)
+    return hh_resume_detail_payload(updated)
+
+
 @app.post("/api/hh-resumes/import")
 async def import_hh_resume(
     file: UploadFile = File(...),
@@ -1367,7 +1571,8 @@ async def import_hh_resume(
     if len(text) < 40:
         raise HTTPException(status_code=422, detail="Не удалось извлечь достаточно текста из файла резюме")
 
-    detected_title = title.strip() or first_content_line(text) or Path(filename).stem
+    parsed_structure = parse_resume_for_channel(channel, text, title.strip() or first_content_line(text) or Path(filename).stem)
+    detected_title = title.strip() or str(parsed_structure.get("title", "")).strip() or first_content_line(text) or Path(filename).stem
     now = datetime.now(timezone.utc).isoformat()
     external_id = extract_hh_resume_external_id(url, text, filename)
     existing = find_hh_resume_by_id(target_resume_id) if import_mode == "update" and target_resume_id else None
@@ -1406,7 +1611,7 @@ async def import_hh_resume(
             "updated_at": now,
             "import_count": import_count,
             "raw_text": text,
-            "parsed_structure": parse_resume_structure(text, detected_title),
+            "parsed_structure": parsed_structure,
         }
     )
     content = "\n".join(str(item.get(key, "")) for key in ["title", "keywords", "raw_text"])

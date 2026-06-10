@@ -545,6 +545,20 @@ button:disabled {
   margin-top: 12px;
 }
 
+.linkedin-profile {
+  align-items: center;
+  display: flex;
+  gap: 12px;
+  margin: 12px 0;
+}
+
+.linkedin-profile img {
+  border-radius: 16px;
+  height: 56px;
+  object-fit: cover;
+  width: 56px;
+}
+
 pre {
   background: #0f172a;
   border-radius: 16px;

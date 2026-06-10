@@ -354,9 +354,9 @@ function CvTypes({ cvTypes, selectedId, onSelect }) {
 function HhResumes({ resumes, selectedId, onSelect }) {
   return (
     <section className="panel cv-types">
-      <h2>Текущие HH-резюме</h2>
+      <h2>Опубликованные резюме</h2>
       {resumes.length === 0 ? (
-        <p className="muted">Справочник пуст. Импортируйте PDF/RTF/HTML/TXT из раздела “Мои резюме” HH.</p>
+        <p className="muted">Справочник пуст. Импортируйте PDF/RTF/HTML/TXT из HH, LinkedIn или другого канала.</p>
       ) : (
         resumes.map((item) => (
           <button
@@ -368,13 +368,42 @@ function HhResumes({ resumes, selectedId, onSelect }) {
             <strong>{item.title}</strong>
             <div className="muted">
               {item.channel || 'hh'} · {item.status}
-              {item.external_id ? ` · HH ID ${item.external_id}` : ''}
+              {item.external_id ? ` · external ID ${item.external_id}` : ''}
               {item.source_filename ? ` · ${item.source_filename}` : ''}
             </div>
             {item.keywords?.length > 0 && <p className="terms">{item.keywords.slice(0, 8).join(', ')}</p>}
           </button>
         ))
       )}
+    </section>
+  );
+}
+
+function LinkedInProfileCard({ status }) {
+  const account = status?.account;
+
+  return (
+    <section className="panel cv-types">
+      <div className="panel-header">
+        <h2>LinkedIn профиль</h2>
+        <Pill tone={status?.connected ? 'blue' : 'default'}>{status?.connected ? 'подключён' : 'не подключён'}</Pill>
+      </div>
+      {!status?.connected ? (
+        <p className="muted">Подключите LinkedIn на вкладке “Каналы”. OpenID Connect отдаёт только базовый профиль, не полное CV.</p>
+      ) : (
+        <div className="linkedin-profile">
+          {account?.picture_url && <img alt="" src={account.picture_url} />}
+          <div>
+            <strong>{account?.name || 'LinkedIn profile'}</strong>
+            {account?.email && <div className="muted">{account.email}</div>}
+            {account?.profile_id && <div className="muted">LinkedIn subject: {account.profile_id}</div>}
+            {account?.updated_at && <div className="muted">Обновлено: {account.updated_at}</div>}
+          </div>
+        </div>
+      )}
+      <p className="muted">
+        Полные CV из LinkedIn нужно импортировать отдельно файлом через блок “Импорт опубликованного резюме” с каналом LinkedIn.
+      </p>
     </section>
   );
 }
@@ -462,7 +491,7 @@ function HhResumeDetail({ detail }) {
   if (!detail) {
     return (
       <section className="panel detail empty">
-        <h2>Выберите HH-резюме</h2>
+        <h2>Выберите опубликованное резюме</h2>
         <p className="muted">Здесь будет полный текст импортированного резюме, метаданные, source-файл и keywords.</p>
       </section>
     );
@@ -476,7 +505,7 @@ function HhResumeDetail({ detail }) {
       </div>
       <div className="grid">
         <DetailMeta label="Статус" value={detail.status} />
-        <DetailMeta label="HH ID" value={detail.external_id} />
+        <DetailMeta label="External ID" value={detail.external_id} />
         <DetailMeta label="Файл" value={detail.source_filename} />
         <DetailMeta label="Обновлено" value={detail.updated_at} />
         <DetailMeta label="Импортов" value={detail.import_count ? String(detail.import_count) : ''} />
@@ -908,7 +937,7 @@ function WorkflowPage({ events, selected, setSelectedId, onChanged }) {
   );
 }
 
-function ResumesPage({ hhResumes, cvTypes, onImported }) {
+function ResumesPage({ hhResumes, cvTypes, linkedinStatus, onImported }) {
   const [detailKind, setDetailKind] = useState('hh');
   const [selectedHhId, setSelectedHhId] = useState('');
   const [selectedCvSlug, setSelectedCvSlug] = useState('');
@@ -953,6 +982,7 @@ function ResumesPage({ hhResumes, cvTypes, onImported }) {
       <ResumeImportBox resumes={hhResumes} onImported={onImported} />
       <div className="content-layout">
         <div>
+          <LinkedInProfileCard status={linkedinStatus} />
           <HhResumes resumes={hhResumes} selectedId={selectedHhId} onSelect={selectHhResume} />
           <CvTypes cvTypes={cvTypes} selectedId={selectedCvSlug} onSelect={selectCvType} />
         </div>
@@ -972,28 +1002,48 @@ function ResumesPage({ hhResumes, cvTypes, onImported }) {
 function ChannelsPage() {
   const [linkedinStatus, setLinkedinStatus] = useState(null);
   const [linkedinError, setLinkedinError] = useState('');
+  const [linkedinConnectStatus, setLinkedinConnectStatus] = useState('');
+
+  async function refreshLinkedInStatus() {
+    const status = await api('/api/channels/linkedin/status');
+    setLinkedinStatus(status);
+    setLinkedinError('');
+    return status;
+  }
 
   useEffect(() => {
-    let isMounted = true;
-    api('/api/channels/linkedin/status')
-      .then((status) => {
-        if (isMounted) {
-          setLinkedinStatus(status);
-          setLinkedinError('');
-        }
-      })
-      .catch((error) => {
-        if (isMounted) {
-          setLinkedinError(error.message);
-        }
-      });
-    return () => {
-      isMounted = false;
-    };
+    refreshLinkedInStatus().catch((error) => setLinkedinError(error.message));
   }, []);
 
   function connectLinkedIn() {
-    window.location.href = `${API_BASE}/api/channels/linkedin/connect`;
+    setLinkedinConnectStatus('Открываю LinkedIn OAuth в отдельном окне...');
+    const authWindow = window.open(`${API_BASE}/api/channels/linkedin/connect`, 'linkedin-oauth', 'width=720,height=820');
+    if (!authWindow) {
+      setLinkedinConnectStatus('Браузер заблокировал окно. Перехожу на LinkedIn в текущей вкладке...');
+      window.location.href = `${API_BASE}/api/channels/linkedin/connect`;
+      return;
+    }
+
+    let attempts = 0;
+    const timer = window.setInterval(async () => {
+      attempts += 1;
+      try {
+        const status = await refreshLinkedInStatus();
+        if (status.connected) {
+          window.clearInterval(timer);
+          setLinkedinConnectStatus('LinkedIn подключён. Профиль сохранён локально.');
+          authWindow.close();
+        } else if (authWindow.closed) {
+          window.clearInterval(timer);
+          setLinkedinConnectStatus('Окно LinkedIn закрыто. Если вход завершён, нажмите “Обновить” или попробуйте подключить снова.');
+        } else if (attempts > 90) {
+          window.clearInterval(timer);
+          setLinkedinConnectStatus('Время ожидания истекло. Проверьте окно LinkedIn или попробуйте подключить снова.');
+        }
+      } catch (error) {
+        setLinkedinError(error.message);
+      }
+    }, 2000);
   }
 
   const channels = [
@@ -1048,6 +1098,10 @@ function ChannelsPage() {
                     {linkedinStatus.account?.email ? ` · ${linkedinStatus.account.email}` : ''}
                   </p>
                 )}
+                <p className="muted">
+                  После подключения базовый профиль сохраняется локально и будет показан прямо в этом блоке.
+                </p>
+                {linkedinConnectStatus && <p className="muted">{linkedinConnectStatus}</p>}
                 <button type="button" onClick={connectLinkedIn} disabled={!linkedinStatus?.configured}>
                   {linkedinStatus?.connected ? 'Переподключить LinkedIn' : 'Подключить LinkedIn'}
                 </button>
@@ -1064,6 +1118,7 @@ function App() {
   const [events, setEvents] = useState([]);
   const [cvTypes, setCvTypes] = useState([]);
   const [hhResumes, setHhResumes] = useState([]);
+  const [linkedinStatus, setLinkedinStatus] = useState(null);
   const [selectedId, setSelectedId] = useState(null);
   const [activePage, setActivePage] = useState('overview');
   const selected = useMemo(
@@ -1076,14 +1131,16 @@ function App() {
   );
 
   async function refresh() {
-    const [nextEvents, nextTypes, nextHhResumes] = await Promise.all([
+    const [nextEvents, nextTypes, nextHhResumes, nextLinkedinStatus] = await Promise.all([
       api('/api/events'),
       api('/api/cv-types'),
       api('/api/hh-resumes'),
+      api('/api/channels/linkedin/status'),
     ]);
     setEvents(nextEvents);
     setCvTypes(nextTypes);
     setHhResumes(nextHhResumes);
+    setLinkedinStatus(nextLinkedinStatus);
   }
 
   useEffect(() => {
@@ -1112,7 +1169,7 @@ function App() {
       return <WorkflowPage events={events} selected={selected} setSelectedId={setSelectedId} onChanged={refresh} />;
     }
     if (activePage === 'resumes') {
-      return <ResumesPage hhResumes={hhResumes} cvTypes={cvTypes} onImported={refresh} />;
+      return <ResumesPage hhResumes={hhResumes} cvTypes={cvTypes} linkedinStatus={linkedinStatus} onImported={refresh} />;
     }
     if (activePage === 'channels') {
       return <ChannelsPage />;
