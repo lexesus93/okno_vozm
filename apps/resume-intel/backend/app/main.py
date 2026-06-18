@@ -11,7 +11,7 @@ import urllib.error
 import urllib.parse
 import urllib.request
 from collections import Counter
-from datetime import datetime, timezone
+from datetime import datetime, timedelta, timezone
 from email import message_from_bytes
 from email.message import EmailMessage
 from email.policy import default
@@ -48,6 +48,10 @@ HH_RESUMES_PATH = Path(os.getenv("HH_RESUMES_PATH", "/app/config/hh_resumes.json
 LINKEDIN_AUTH_URL = "https://www.linkedin.com/oauth/v2/authorization"
 LINKEDIN_TOKEN_URL = "https://www.linkedin.com/oauth/v2/accessToken"
 LINKEDIN_USERINFO_URL = "https://api.linkedin.com/v2/userinfo"
+HH_AUTH_URL = "https://hh.ru/oauth/authorize"
+HH_TOKEN_URL = "https://hh.ru/oauth/token"
+HH_ME_URL = "https://api.hh.ru/me"
+HH_USER_AGENT = "ResumeIntel/0.1 (alx.matveev@yandex.ru)"
 
 STOPWORDS = {
     "для",
@@ -106,6 +110,10 @@ class VacancyInput(BaseModel):
     description: str
 
 
+class HhVacancySaveInput(BaseModel):
+    vacancy_id: str
+
+
 class NativeMailInput(BaseModel):
     subject: str = ""
     sender: str = ""
@@ -122,6 +130,14 @@ class ResumeImportResult(BaseModel):
     url: str
     notes: str
     keywords: list[str]
+
+
+class ResumeContentInput(BaseModel):
+    content: str
+
+
+class CvDocumentInput(BaseModel):
+    content: str
 
 
 app = FastAPI(title="Resume Intel", version="0.1.0")
@@ -181,10 +197,39 @@ def init_db() -> None:
                 company_name TEXT NOT NULL,
                 title TEXT NOT NULL,
                 url TEXT,
-                description TEXT NOT NULL
+                description TEXT NOT NULL,
+                source TEXT DEFAULT 'manual',
+                external_id TEXT,
+                employer_id TEXT,
+                employer_name TEXT,
+                area_name TEXT,
+                salary TEXT,
+                published_at TEXT,
+                raw_json TEXT
             )
             """
         )
+        existing_columns = {
+            row["name"]
+            for row in conn.execute("PRAGMA table_info(company_vacancies)").fetchall()
+        }
+        vacancy_columns = {
+            "source": "TEXT DEFAULT 'manual'",
+            "external_id": "TEXT",
+            "employer_id": "TEXT",
+            "employer_name": "TEXT",
+            "area_name": "TEXT",
+            "salary": "TEXT",
+            "published_at": "TEXT",
+            "raw_json": "TEXT",
+            "import_event_id": "INTEGER",
+            "recommended_resume_title": "TEXT",
+            "recommended_hh_resume_id": "TEXT",
+            "recommended_cv_type_slug": "TEXT",
+        }
+        for column, definition in vacancy_columns.items():
+            if column not in existing_columns:
+                conn.execute(f"ALTER TABLE company_vacancies ADD COLUMN {column} {definition}")
         conn.execute(
             """
             CREATE TABLE IF NOT EXISTS channel_accounts (
@@ -209,11 +254,25 @@ def init_db() -> None:
             )
             """
         )
+        conn.execute(
+            """
+            CREATE TABLE IF NOT EXISTS channel_tokens (
+                channel TEXT PRIMARY KEY,
+                created_at TEXT NOT NULL,
+                updated_at TEXT NOT NULL,
+                access_token TEXT NOT NULL,
+                refresh_token TEXT,
+                expires_at TEXT,
+                raw_token TEXT NOT NULL
+            )
+            """
+        )
 
 
 @app.on_event("startup")
 def on_startup() -> None:
     init_db()
+    backfill_vacancy_recommendations()
 
 
 def strip_html(value: str) -> str:
@@ -410,6 +469,31 @@ def extract_bullets(content: str) -> list[str]:
     return bullets
 
 
+def join_wrapped_lines(lines: list[str]) -> list[str]:
+    joined: list[str] = []
+    for line in lines:
+        stripped = line.strip()
+        if not stripped:
+            continue
+        if not joined:
+            joined.append(stripped)
+            continue
+
+        starts_new_item = bool(
+            re.match(r"^\s*[-*•]\s+", stripped)
+            or re.match(r"^#{1,4}\s+", stripped)
+            or looks_like_period(stripped)
+        )
+        previous = joined[-1]
+        previous_is_open = not re.search(r"[.!?;:]$", previous)
+        current_is_continuation = stripped[:1].islower() or bool(re.match(r"^[&/,)]", stripped))
+        if not starts_new_item and (previous_is_open or current_is_continuation):
+            joined[-1] = normalize_text(f"{previous} {stripped}")
+        else:
+            joined.append(stripped)
+    return joined
+
+
 def section_slug(title: str) -> str:
     lowered = title.lower()
     if any(value in lowered for value in ["профиль", "о себе", "summary", "about"]):
@@ -450,8 +534,8 @@ def enrich_markdown_sections(sections: list[dict[str, Any]]) -> list[dict[str, A
 
 def split_plain_resume_sections(text: str) -> dict[str, str]:
     aliases = {
-        "summary": ["о себе", "обо мне", "профессиональный профиль", "summary", "about"],
-        "skills": ["ключевые навыки", "навыки", "skills", "компетенции"],
+        "summary": ["о себе", "обо мне", "профессиональный профиль", "ключевые кейсы и достижения", "summary", "about"],
+        "skills": ["ключевые навыки", "ключевые компетенции", "навыки", "skills", "компетенции"],
         "experience": ["опыт работы", "профессиональный опыт", "work experience", "experience"],
         "education": ["образование", "education"],
         "certifications": ["повышение квалификации", "курсы", "сертификаты", "дополнительное обучение"],
@@ -465,7 +549,7 @@ def split_plain_resume_sections(text: str) -> dict[str, str]:
     sections: dict[str, list[str]] = {"header": []}
     current = "header"
     for line in compact_lines(text):
-        normalized = line.lower().strip(" .:")
+        normalized = re.sub(r"^#{1,4}\s+", "", line).lower().strip(" .:")
         for heading, key in line_to_key.items():
             if normalized == heading or normalized.startswith(f"{heading} "):
                 current = key
@@ -550,6 +634,12 @@ def split_skills(value: str) -> list[str]:
     return list(dict.fromkeys(skills))
 
 
+def strip_markdown_inline(value: str) -> str:
+    value = re.sub(r"^#{1,4}\s+", "", value.strip())
+    value = re.sub(r"^\*\*(.+?)\*\*$", r"\1", value)
+    return normalize_entity(value)
+
+
 def looks_like_period(line: str) -> bool:
     months = (
         "январ", "феврал", "март", "апрел", "ма", "июн", "июл", "август",
@@ -575,6 +665,8 @@ def parse_experience_entries(experience_text: str) -> list[dict[str, Any]]:
             next_period_idx = period_indexes[order + 1] if order + 1 < len(period_indexes) else len(lines)
             company_start = 0 if order == 0 else period_indexes[order - 1] + 1
             company_candidates = []
+            raw_period = strip_markdown_inline(lines[period_idx])
+            markdown_period_match = re.match(r"(.+?[—-].+?)[—-]\s+(.+)$", raw_period)
             for idx in range(period_idx - 1, company_start - 1, -1):
                 line = lines[idx]
                 if line.startswith("-"):
@@ -584,7 +676,11 @@ def parse_experience_entries(experience_text: str) -> list[dict[str, Any]]:
                 company_candidates.append(line)
             company_candidates = list(reversed(company_candidates))
 
-            period_parts = [lines[period_idx]]
+            if markdown_period_match:
+                period_parts = [normalize_entity(markdown_period_match.group(1))]
+                company_candidates = [normalize_entity(markdown_period_match.group(2))]
+            else:
+                period_parts = [raw_period]
             cursor = period_idx + 1
             if cursor < len(lines) and re.search(r"(19|20)\d{2}|настоящее|present", lines[cursor], re.I):
                 period_parts.append(lines[cursor])
@@ -592,7 +688,7 @@ def parse_experience_entries(experience_text: str) -> list[dict[str, Any]]:
             if cursor < len(lines) and looks_like_duration(lines[cursor]):
                 cursor += 1
 
-            position = lines[cursor] if cursor < len(lines) else ""
+            position = strip_markdown_inline(lines[cursor]) if cursor < len(lines) else ""
             cursor += 1
             body = lines[cursor:next_period_idx]
             while body and not body[-1].startswith("-"):
@@ -684,7 +780,7 @@ def parse_linkedin_experience_entries(experience_text: str) -> list[dict[str, An
         if body_start < len(lines) and looks_like_location(lines[body_start]):
             body_start += 1
         body_end = header_starts[order + 1] if order + 1 < len(header_starts) else len(lines)
-        description = normalize_text("\n".join(lines[body_start:body_end]))
+        description = normalize_text("\n".join(join_wrapped_lines(lines[body_start:body_end])))
 
         entries.append(
             {
@@ -779,6 +875,8 @@ def detect_source(subject: str, sender: str, text: str) -> str:
     value = f"{subject}\n{sender}\n{text[:1000]}".lower()
     if "hh.ru" in value or "headhunter" in value or "хэдхантер" in value:
         return "hh"
+    if "facancy" in value:
+        return "facancy"
     if "linkedin" in value:
         return "linkedin"
     return "unknown"
@@ -788,7 +886,7 @@ def detect_event_type(subject: str, text: str) -> str:
     value = f"{subject}\n{text[:1500]}".lower()
     if "привлекло внимание" in value or "просмотр" in value or "посмотрел" in value:
         return "resume_attention"
-    if "подходящие вакансии" in value or "recommended jobs" in value:
+    if "подходящие вакансии" in value or "recommended jobs" in value or "вот лучшие для вас вакансии" in value or "вот хорошие для вас вакансии" in value:
         return "recommended_jobs"
     if "отклик" in value or "приглашение" in value or "interview" in value:
         return "recruiter_message"
@@ -960,6 +1058,26 @@ def parse_upload(filename: str, payload: bytes) -> dict[str, Any]:
     }
 
 
+def decode_native_mail_message(message: NativeMailInput) -> dict[str, str]:
+    raw_body = normalize_text(message.body)
+    if looks_like_rfc822(raw_body):
+        decoded = decode_upload(message.raw_filename, raw_body.encode("utf-8", errors="replace"))
+        return {
+            "subject": decoded["subject"] or message.subject.strip() or first_subject_line(decoded["body"]),
+            "sender": decoded["sender"] or message.sender.strip(),
+            "sent_at": decoded["sent_at"] or message.sent_at,
+            "body": normalize_text(decoded["body"]),
+            "raw_filename": message.raw_filename,
+        }
+    return {
+        "subject": message.subject.strip() or first_subject_line(raw_body),
+        "sender": message.sender.strip(),
+        "sent_at": message.sent_at,
+        "body": raw_body,
+        "raw_filename": message.raw_filename,
+    }
+
+
 def is_subject_only_mail_hint(parsed: dict[str, Any]) -> bool:
     raw_text = parsed.get("raw_text", "").strip()
     subject = parsed.get("subject", "").strip()
@@ -1006,8 +1124,10 @@ def load_cv_types() -> list[dict[str, str]]:
         headline_match = re.search(r"\*\*([^*]+)\*\*", cv_path.read_text(encoding="utf-8", errors="replace") if cv_path.exists() else "")
         if headline_match:
             title = headline_match.group(1)
-        items.append({"slug": folder.name, "title": title, "content": content})
-    return items
+        documents = [path for path in [skills_path, analysis_path, cv_path] if path.exists()]
+        updated_at = max((path.stat().st_mtime for path in documents), default=folder.stat().st_mtime)
+        items.append({"slug": folder.name, "title": title, "content": content, "updated_at": updated_at})
+    return sorted(items, key=lambda item: float(item.get("updated_at", 0)), reverse=True)
 
 
 def load_cv_type_detail(slug: str) -> dict[str, Any] | None:
@@ -1073,6 +1193,38 @@ def load_cv_type_detail(slug: str) -> dict[str, Any] | None:
     }
 
 
+ALLOWED_CV_DOCUMENTS = {
+    "analysis.md",
+    "skills_requirements.md",
+    "tailored_cv.md",
+    "cover_letter_template.md",
+    "interview_prep.md",
+    "source_cases.md",
+}
+
+
+def save_cv_type_document(slug: str, filename: str, content: str) -> dict[str, Any]:
+    if filename not in ALLOWED_CV_DOCUMENTS:
+        raise HTTPException(status_code=400, detail="Этот документ CV-типа нельзя редактировать из UI")
+    folder = CV_TYPES_DIR / slug
+    if not folder.exists() or not folder.is_dir():
+        raise HTTPException(status_code=404, detail="CV-тип не найден")
+    path = folder / filename
+    if not path.exists():
+        raise HTTPException(status_code=404, detail="Документ CV-типа не найден")
+    try:
+        path.write_text(content.rstrip() + "\n", encoding="utf-8")
+    except OSError as error:
+        raise HTTPException(
+            status_code=500,
+            detail=f"Не удалось сохранить документ CV-типа: {error}",
+        ) from error
+    detail = load_cv_type_detail(slug)
+    if detail is None:
+        raise HTTPException(status_code=404, detail="CV-тип не найден после сохранения")
+    return detail
+
+
 def load_hh_resumes() -> list[dict[str, str]]:
     if not HH_RESUMES_PATH.exists():
         return []
@@ -1096,15 +1248,17 @@ def load_hh_resumes() -> list[dict[str, str]]:
                 "title": title,
                 "status": str(item.get("status", "current_hh")),
                 "channel": str(item.get("channel", "hh")),
+                "source": str(item.get("source", "manual")),
                 "external_id": str(item.get("external_id", "")),
                 "url": str(item.get("url", "")),
                 "notes": str(item.get("notes", "")),
                 "source_filename": str(item.get("source_filename", "")),
                 "updated_at": str(item.get("updated_at", item.get("imported_at", ""))),
+                "api_updated_at": str(item.get("api_updated_at", "")),
                 "content": content,
             }
         )
-    return result
+    return sorted(result, key=lambda item: item.get("updated_at", ""), reverse=True)
 
 
 def save_hh_resume(item: dict[str, Any]) -> dict[str, Any]:
@@ -1171,14 +1325,18 @@ def hh_resume_detail_payload(item: dict[str, Any]) -> dict[str, Any]:
         "title": str(item.get("title", "")),
         "status": str(item.get("status", "current_hh")),
         "channel": str(item.get("channel", "hh")),
+        "source": str(item.get("source", "manual")),
         "external_id": str(item.get("external_id", "")),
         "url": str(item.get("url", "")),
         "notes": str(item.get("notes", "")),
         "source_filename": str(item.get("source_filename", "")),
         "created_at": str(item.get("created_at", "")),
         "updated_at": str(item.get("updated_at", item.get("imported_at", ""))),
+        "api_imported_at": str(item.get("api_imported_at", "")),
+        "api_updated_at": str(item.get("api_updated_at", "")),
         "import_count": int(item.get("import_count", 0) or 0),
         "raw_text": str(item.get("raw_text", "")),
+        "raw_api_data": item.get("raw_api_data"),
         "parsed_structure": parsed_structure,
         "keywords": resume_keywords(item, parsed_structure, content, 120),
     }
@@ -1196,6 +1354,796 @@ def resume_keywords(
         return skills[:limit]
     source = content if content is not None else "\n".join(str(item.get(key, "")) for key in ["title", "keywords", "raw_text"])
     return sorted(tokens(source))[:limit]
+
+
+def hh_api_get(path: str, *, access_token: str | None = None, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    token = access_token or hh_access_token()
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    return request_json(f"https://api.hh.ru{path}{query}", access_token=token, provider="HH")
+
+
+def hh_api_name(value: Any) -> str:
+    if isinstance(value, dict):
+        return str(value.get("name") or value.get("id") or "").strip()
+    if isinstance(value, list):
+        return ", ".join(item for item in (hh_api_name(part) for part in value) if item)
+    return str(value or "").strip()
+
+
+def hh_api_period(start: str, end: str | None = None) -> str:
+    if start and end:
+        return f"{start} — {end}"
+    if start:
+        return f"{start} — настоящее время"
+    return ""
+
+
+def parse_hh_api_resume_structure(resume: dict[str, Any]) -> dict[str, Any]:
+    title = str(resume.get("title") or resume.get("id") or "HH resume")
+    first_name = str(resume.get("first_name", "") or "").strip()
+    last_name = str(resume.get("last_name", "") or "").strip()
+    middle_name = str(resume.get("middle_name", "") or "").strip()
+    full_name = " ".join(part for part in [last_name, first_name, middle_name] if part)
+    header = [
+        value
+        for value in [
+            full_name,
+            title,
+            hh_api_name(resume.get("area")),
+            str(resume.get("age", "") or ""),
+            hh_api_name(resume.get("employment")),
+            hh_api_name(resume.get("schedule")),
+        ]
+        if value
+    ]
+
+    skill_set = [str(skill).strip() for skill in resume.get("skill_set", []) if str(skill).strip()]
+    skills_text = str(resume.get("skills", "") or "").strip()
+    if skills_text and skills_text not in skill_set:
+        skill_set.append(skills_text)
+
+    experience = []
+    for item in resume.get("experience", []) or []:
+        if not isinstance(item, dict):
+            continue
+        period = hh_api_period(str(item.get("start", "") or ""), item.get("end"))
+        description = normalize_text(str(item.get("description", "") or ""))
+        experience.append(
+            {
+                "period": period,
+                "company": str(item.get("company", "") or ""),
+                "position": str(item.get("position", "") or ""),
+                "description": description,
+                "achievements": extract_bullets(description),
+            }
+        )
+
+    education_lines = []
+    education = resume.get("education") or {}
+    if isinstance(education, dict):
+        for education_item in education.get("primary", []) or []:
+            if not isinstance(education_item, dict):
+                continue
+            education_lines.append(
+                normalize_entity(
+                    ", ".join(
+                        part
+                        for part in [
+                            str(education_item.get("name", "") or ""),
+                            str(education_item.get("organization", "") or ""),
+                            str(education_item.get("result", "") or ""),
+                            str(education_item.get("year", "") or ""),
+                        ]
+                        if part
+                    )
+                )
+            )
+
+    languages = []
+    for language in resume.get("language", []) or []:
+        if not isinstance(language, dict):
+            continue
+        languages.append(
+            " — ".join(part for part in [hh_api_name(language), hh_api_name(language.get("level"))] if part)
+        )
+
+    certifications = []
+    for certificate in resume.get("certificate", []) or []:
+        if not isinstance(certificate, dict):
+            continue
+        certifications.append(
+            normalize_entity(
+                ", ".join(
+                    part
+                    for part in [
+                        str(certificate.get("title", "") or ""),
+                        str(certificate.get("company", "") or ""),
+                        str(certificate.get("achieved_at", "") or ""),
+                    ]
+                    if part
+                )
+            )
+        )
+
+    sections = [
+        {"key": key, "title": key, "content": normalize_text(json.dumps(value, ensure_ascii=False))}
+        for key, value in resume.items()
+        if value not in ("", None, [], {})
+    ]
+    return {
+        "title": title,
+        "header": header[:12],
+        "summary": skills_text,
+        "skills": skill_set,
+        "experience": experience,
+        "education": [line for line in education_lines if line],
+        "certifications": [line for line in certifications if line],
+        "languages": [line for line in languages if line],
+        "sections": sections,
+        "parser_notes": [
+            "HH API resume сохранено как структурированный JSON; raw_api_data содержит полный ответ HH без потери дополнительных секций.",
+        ],
+    }
+
+
+def render_hh_api_resume_text(resume: dict[str, Any], structure: dict[str, Any]) -> str:
+    lines = [
+        f"Резюме \"{structure['title']}\"",
+        f"HH resume id: {resume.get('id', '')}",
+        f"Обновлено в HH: {resume.get('updated_at', '')}",
+        "",
+    ]
+    if structure.get("header"):
+        lines.extend(str(line) for line in structure["header"])
+        lines.append("")
+    if structure.get("summary"):
+        lines.extend(["Обо мне", str(structure["summary"]), ""])
+    if structure.get("skills"):
+        lines.extend(["Навыки", "; ".join(structure["skills"]), ""])
+    if structure.get("experience"):
+        lines.append("Опыт работы")
+        for item in structure["experience"]:
+            lines.extend(
+                [
+                    str(item.get("company", "")),
+                    str(item.get("position", "")),
+                    str(item.get("period", "")),
+                    str(item.get("description", "")),
+                    "",
+                ]
+            )
+    if structure.get("education"):
+        lines.extend(["Образование", *structure["education"], ""])
+    if structure.get("certifications"):
+        lines.extend(["Сертификации", *structure["certifications"], ""])
+    if structure.get("languages"):
+        lines.extend(["Языки", *structure["languages"], ""])
+    return normalize_text("\n".join(lines))
+
+
+def save_hh_api_resume(resume: dict[str, Any]) -> dict[str, Any]:
+    external_id = str(resume.get("id", "") or "")
+    if not external_id:
+        raise HTTPException(status_code=502, detail="HH API вернул резюме без id")
+    structure = parse_hh_api_resume_structure(resume)
+    raw_text = render_hh_api_resume_text(resume, structure)
+    now = utc_now()
+    existing = find_hh_resume_by_external_id(external_id)
+    created_at = str((existing or {}).get("created_at", now))
+    import_count = int((existing or {}).get("import_count", 0) or 0) + 1
+    item = {
+        **(existing or {}),
+        "id": str((existing or {}).get("id") or f"hh-resume-{external_id}"),
+        "title": structure["title"],
+        "status": "current_hh",
+        "channel": "hh",
+        "source": "hh_api",
+        "external_id": external_id,
+        "url": str(resume.get("alternate_url", "") or (existing or {}).get("url", "")),
+        "keywords": " ".join(resume_keywords({}, structure, raw_text, 160)),
+        "notes": f"Синхронизировано из HH API {now}",
+        "source_filename": "",
+        "created_at": created_at,
+        "imported_at": now,
+        "updated_at": now,
+        "api_imported_at": now,
+        "api_updated_at": str(resume.get("updated_at", "") or ""),
+        "import_count": import_count,
+        "raw_text": raw_text,
+        "parsed_structure": structure,
+        "raw_api_data": resume,
+    }
+    return save_hh_resume(item)
+
+
+def hh_salary_text(salary: Any) -> str:
+    if not isinstance(salary, dict) or not salary:
+        return ""
+    parts = []
+    if salary.get("from") is not None:
+        parts.append(f"от {salary['from']}")
+    if salary.get("to") is not None:
+        parts.append(f"до {salary['to']}")
+    if salary.get("currency"):
+        parts.append(str(salary["currency"]))
+    if salary.get("gross") is not None:
+        parts.append("до вычета налогов" if salary.get("gross") else "на руки")
+    return " ".join(parts)
+
+
+def hh_vacancy_description(vacancy: dict[str, Any]) -> str:
+    parts = [
+        strip_html(str(vacancy.get("description", "") or "")),
+        strip_html(str((vacancy.get("snippet") or {}).get("requirement", "") or "")),
+        strip_html(str((vacancy.get("snippet") or {}).get("responsibility", "") or "")),
+    ]
+    return normalize_text("\n\n".join(part for part in parts if part.strip()))
+
+
+def hh_vacancy_payload(vacancy: dict[str, Any]) -> dict[str, Any]:
+    employer = vacancy.get("employer") if isinstance(vacancy.get("employer"), dict) else {}
+    area = vacancy.get("area") if isinstance(vacancy.get("area"), dict) else {}
+    return {
+        "source": "hh_api",
+        "external_id": str(vacancy.get("id", "") or ""),
+        "company_name": str(employer.get("name") or ""),
+        "employer_id": str(employer.get("id") or ""),
+        "employer_name": str(employer.get("name") or ""),
+        "title": str(vacancy.get("name", "") or ""),
+        "url": str(vacancy.get("alternate_url", "") or vacancy.get("url", "") or ""),
+        "description": hh_vacancy_description(vacancy),
+        "area_name": str(area.get("name") or ""),
+        "salary": hh_salary_text(vacancy.get("salary")),
+        "published_at": str(vacancy.get("published_at", "") or ""),
+        "raw_json": json.dumps(vacancy, ensure_ascii=False),
+    }
+
+
+def parse_iso_datetime(value: str | None) -> datetime | None:
+    if not value:
+        return None
+    try:
+        return datetime.fromisoformat(str(value).replace("Z", "+00:00"))
+    except ValueError:
+        return None
+
+
+def resolve_recommended_profile(resume_title: str) -> dict[str, str]:
+    normalized_title = normalize_entity(resume_title)
+    if not normalized_title:
+        return {
+            "recommended_resume_title": "",
+            "recommended_hh_resume_id": "",
+            "recommended_cv_type_slug": "",
+        }
+
+    best_resume: dict[str, str] | None = None
+    best_resume_score = 0.0
+    title_tokens = tokens(normalized_title)
+    for resume in load_hh_resumes():
+        resume_title_lower = resume["title"].lower()
+        digest_title_lower = normalized_title.lower()
+        title_match = (
+            digest_title_lower in resume_title_lower
+            or resume_title_lower in digest_title_lower
+            or normalized_title.lower() == resume.get("notes", "").lower()
+        )
+        overlap = title_tokens & tokens(resume["content"])
+        score = 0.95 if title_match else round(len(overlap) / max(6, len(title_tokens)), 3)
+        if score > best_resume_score:
+            best_resume_score = score
+            best_resume = resume
+
+    best_cv: dict[str, str] | None = None
+    best_cv_score = 0.0
+    for cv_type in load_cv_types():
+        overlap = title_tokens & tokens(cv_type["content"])
+        title_overlap = title_tokens & tokens(cv_type["title"])
+        score = round((len(overlap) + len(title_overlap) * 2) / max(8, len(title_tokens)), 3)
+        if score > best_cv_score:
+            best_cv_score = score
+            best_cv = cv_type
+
+    return {
+        "recommended_resume_title": normalized_title,
+        "recommended_hh_resume_id": best_resume["id"] if best_resume and best_resume_score >= 0.12 else "",
+        "recommended_cv_type_slug": best_cv["slug"] if best_cv and best_cv_score >= 0.08 else "",
+    }
+
+
+def build_recommended_profile(row: dict[str, Any]) -> dict[str, Any] | None:
+    resume_title = str(row.get("recommended_resume_title") or "")
+    hh_id = str(row.get("recommended_hh_resume_id") or "")
+    cv_slug = str(row.get("recommended_cv_type_slug") or "")
+    import_event_id = row.get("import_event_id")
+    if not resume_title and not hh_id and not cv_slug and not import_event_id:
+        return None
+
+    hh_title = ""
+    if hh_id:
+        for resume in load_hh_resumes():
+            if resume["id"] == hh_id:
+                hh_title = resume["title"]
+                break
+
+    cv_title = ""
+    if cv_slug:
+        for cv_type in load_cv_types():
+            if cv_type["slug"] == cv_slug:
+                cv_title = cv_type["title"]
+                break
+
+    return {
+        "import_event_id": import_event_id,
+        "resume_title": resume_title,
+        "hh_resume_id": hh_id,
+        "hh_resume_title": hh_title,
+        "cv_type_slug": cv_slug,
+        "cv_type_title": cv_title,
+    }
+
+
+def sources_compatible(vacancy_source: str | None, event_source: str | None) -> bool:
+    vacancy_source = str(vacancy_source or "")
+    event_source = str(event_source or "")
+    if vacancy_source == event_source:
+        return True
+    if event_source == "hh" and vacancy_source == "hh_api":
+        return True
+    return False
+
+
+def vacancy_linked_to_event(row: sqlite3.Row | dict[str, Any], event: sqlite3.Row | dict[str, Any]) -> bool:
+    row_dict = dict(row)
+    event_dict = dict(event)
+    raw_json = str(row_dict.get("raw_json") or "")
+    raw_filename = str(event_dict.get("raw_filename") or "")
+    if raw_filename and raw_filename in raw_json:
+        return True
+
+    mail_subject = ""
+    if raw_json:
+        try:
+            mail_subject = str(json.loads(raw_json).get("mail_subject") or "")
+        except json.JSONDecodeError:
+            mail_subject = ""
+    if mail_subject and mail_subject == str(event_dict.get("subject") or ""):
+        return True
+
+    row_created = parse_iso_datetime(str(row_dict.get("created_at") or ""))
+    event_created = parse_iso_datetime(str(event_dict.get("created_at") or ""))
+    if row_created and event_created:
+        delta = abs((row_created - event_created).total_seconds())
+        return delta <= 30 and sources_compatible(str(row_dict.get("source") or ""), str(event_dict.get("source") or ""))
+    return False
+
+
+def backfill_vacancy_recommendations() -> dict[str, int]:
+    updated = 0
+    cleared = 0
+    with connect() as conn:
+        events = conn.execute(
+            "SELECT * FROM email_events WHERE event_type = 'recommended_jobs' ORDER BY id DESC"
+        ).fetchall()
+        vacancies = conn.execute("SELECT * FROM company_vacancies ORDER BY id").fetchall()
+        events_by_id = {event["id"]: event for event in events}
+
+        for vacancy in vacancies:
+            vacancy_dict = dict(vacancy)
+            event_id = vacancy_dict.get("import_event_id")
+            if event_id:
+                event = events_by_id.get(event_id)
+                if not event or not vacancy_linked_to_event(vacancy, event):
+                    conn.execute(
+                        """
+                        UPDATE company_vacancies
+                        SET import_event_id = NULL,
+                            recommended_resume_title = '',
+                            recommended_hh_resume_id = '',
+                            recommended_cv_type_slug = ''
+                        WHERE id = ?
+                        """,
+                        (vacancy["id"],),
+                    )
+                    cleared += 1
+                    vacancy_dict = {
+                        **vacancy_dict,
+                        "import_event_id": None,
+                        "recommended_resume_title": "",
+                        "recommended_hh_resume_id": "",
+                        "recommended_cv_type_slug": "",
+                    }
+
+            if vacancy_dict.get("recommended_resume_title"):
+                continue
+
+            linked_event = None
+            for event in events:
+                if not vacancy_linked_to_event(vacancy, event):
+                    continue
+                resume_title = str(event["resume_title"] or "")
+                if not resume_title:
+                    resume_title = extract_digest_resume_title(str(event["subject"] or ""), str(event["raw_text"] or ""))
+                if resume_title:
+                    linked_event = event
+                    break
+
+            if not linked_event:
+                continue
+
+            resume_title = str(linked_event["resume_title"] or "")
+            if not resume_title:
+                resume_title = extract_digest_resume_title(
+                    str(linked_event["subject"] or ""),
+                    str(linked_event["raw_text"] or ""),
+                )
+            profile = resolve_recommended_profile(resume_title)
+            if not profile["recommended_resume_title"]:
+                continue
+
+            conn.execute(
+                """
+                UPDATE company_vacancies
+                SET import_event_id = ?, recommended_resume_title = ?,
+                    recommended_hh_resume_id = ?, recommended_cv_type_slug = ?
+                WHERE id = ?
+                """,
+                (
+                    linked_event["id"],
+                    profile["recommended_resume_title"],
+                    profile["recommended_hh_resume_id"],
+                    profile["recommended_cv_type_slug"],
+                    vacancy["id"],
+                ),
+            )
+            updated += 1
+    return {"updated": updated, "cleared": cleared}
+
+
+def vacancy_match_payload(vacancy: dict[str, Any]) -> dict[str, Any]:
+    source_text = "\n".join(
+        str(vacancy.get(key, "") or "")
+        for key in ["title", "company_name", "employer_name", "description"]
+    )
+    vacancy_tokens = tokens(source_text)
+    cv_matches = []
+    for cv_type in load_cv_types():
+        overlap = vacancy_tokens & tokens(cv_type["content"])
+        score = 0 if not vacancy_tokens else round(len(overlap) / max(12, min(len(vacancy_tokens), 160)), 3)
+        cv_matches.append(
+            {
+                "slug": cv_type["slug"],
+                "title": cv_type["title"],
+                "score": score,
+                "overlap_terms": sorted(overlap)[:12],
+                "recommendations": TYPE_RECOMMENDATIONS.get(cv_type["slug"], []),
+            }
+        )
+
+    resume_matches = []
+    for resume in load_hh_resumes():
+        overlap = vacancy_tokens & tokens(resume["content"])
+        score = 0 if not vacancy_tokens else round(len(overlap) / max(8, min(len(vacancy_tokens), 120)), 3)
+        resume_matches.append(
+            {
+                "id": resume["id"],
+                "title": resume["title"],
+                "status": resume["status"],
+                "url": resume["url"],
+                "score": score,
+                "overlap_terms": sorted(overlap)[:12],
+                "notes": resume["notes"],
+            }
+        )
+
+    recommended_profile = build_recommended_profile(vacancy)
+    if recommended_profile:
+        for match in cv_matches:
+            if match["slug"] == recommended_profile.get("cv_type_slug"):
+                match["recommended"] = True
+                match["score"] = max(match["score"], 0.9)
+        for match in resume_matches:
+            if match["id"] == recommended_profile.get("hh_resume_id"):
+                match["recommended"] = True
+                match["score"] = max(match["score"], 0.9)
+
+    return {
+        **vacancy,
+        "recommended_profile": recommended_profile,
+        "cv_type_matches": sorted(cv_matches, key=lambda item: item["score"], reverse=True),
+        "hh_resume_matches": sorted(resume_matches, key=lambda item: item["score"], reverse=True),
+    }
+
+
+def vacancy_payload(row: dict[str, Any]) -> dict[str, Any]:
+    return vacancy_match_payload(
+        {
+            **row,
+            "raw_json": row.get("raw_json", ""),
+        }
+    )
+
+
+def save_company_vacancy(payload: dict[str, Any]) -> dict[str, Any]:
+    now = utc_now()
+    company = normalize_entity(str(payload.get("company_name") or payload.get("employer_name") or "Компания не определена"))
+    title = normalize_entity(str(payload.get("title") or "Вакансия без названия"))
+    description = normalize_text(str(payload.get("description") or "")) or title
+    values = {
+        "created_at": now,
+        "company_name": company,
+        "title": title,
+        "url": str(payload.get("url") or ""),
+        "description": description,
+        "source": str(payload.get("source") or "manual"),
+        "external_id": str(payload.get("external_id") or ""),
+        "employer_id": str(payload.get("employer_id") or ""),
+        "employer_name": normalize_entity(str(payload.get("employer_name") or company)),
+        "area_name": normalize_entity(str(payload.get("area_name") or "")),
+        "salary": str(payload.get("salary") or ""),
+        "published_at": str(payload.get("published_at") or ""),
+        "raw_json": str(payload.get("raw_json") or ""),
+        "import_event_id": payload.get("import_event_id"),
+        "recommended_resume_title": str(payload.get("recommended_resume_title") or ""),
+        "recommended_hh_resume_id": str(payload.get("recommended_hh_resume_id") or ""),
+        "recommended_cv_type_slug": str(payload.get("recommended_cv_type_slug") or ""),
+    }
+    with connect() as conn:
+        existing = None
+        if values["source"] == "hh_api" and values["external_id"]:
+            existing = conn.execute(
+                "SELECT * FROM company_vacancies WHERE source = ? AND external_id = ?",
+                (values["source"], values["external_id"]),
+            ).fetchone()
+        if existing:
+            conn.execute(
+                """
+                UPDATE company_vacancies
+                SET created_at = ?, company_name = ?, title = ?, url = ?, description = ?,
+                    employer_id = ?, employer_name = ?, area_name = ?, salary = ?,
+                    published_at = ?, raw_json = ?, import_event_id = ?,
+                    recommended_resume_title = ?, recommended_hh_resume_id = ?,
+                    recommended_cv_type_slug = ?
+                WHERE id = ?
+                """,
+                (
+                    values["created_at"], values["company_name"], values["title"], values["url"],
+                    values["description"], values["employer_id"], values["employer_name"], values["area_name"],
+                    values["salary"], values["published_at"], values["raw_json"], values["import_event_id"],
+                    values["recommended_resume_title"], values["recommended_hh_resume_id"],
+                    values["recommended_cv_type_slug"], existing["id"],
+                ),
+            )
+            vacancy_id = existing["id"]
+        else:
+            cursor = conn.execute(
+                """
+                INSERT INTO company_vacancies (
+                    created_at, company_name, title, url, description, source,
+                    external_id, employer_id, employer_name, area_name, salary,
+                    published_at, raw_json, import_event_id, recommended_resume_title,
+                    recommended_hh_resume_id, recommended_cv_type_slug
+                )
+                VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+                """,
+                (
+                    values["created_at"], values["company_name"], values["title"], values["url"],
+                    values["description"], values["source"], values["external_id"], values["employer_id"],
+                    values["employer_name"], values["area_name"], values["salary"], values["published_at"],
+                    values["raw_json"], values["import_event_id"], values["recommended_resume_title"],
+                    values["recommended_hh_resume_id"], values["recommended_cv_type_slug"],
+                ),
+            )
+            vacancy_id = cursor.lastrowid
+        row = conn.execute("SELECT * FROM company_vacancies WHERE id = ?", (vacancy_id,)).fetchone()
+    return vacancy_payload(dict(row))
+
+
+VACANCY_DIGEST_STOP_LINES = {
+    "посмотреть еще",
+    "если нужна помощь",
+    "написать в поддержку",
+    "управлять рассылкой",
+    "оставайтесь на связи",
+    "мобильное приложение",
+}
+
+
+def looks_like_salary_line(line: str) -> bool:
+    lowered = line.lower()
+    return bool(
+        re.search(r"\d", line)
+        and any(value in lowered for value in ["₽", "руб", "€", "$", "usd", "eur", "за месяц", "gross", "net", "от ", "до "])
+    )
+
+
+def looks_like_footer_line(line: str) -> bool:
+    lowered = line.lower().strip(" .")
+    return (
+        lowered in VACANCY_DIGEST_STOP_LINES
+        or "вы получили это письмо" in lowered
+        or "ооо" in lowered and "хэдхантер" in lowered
+        or lowered.startswith("©")
+    )
+
+
+def extract_digest_resume_title(subject: str, body: str) -> str:
+    value = f"{subject}\n{body}"
+    title = find_first(
+        [
+            r"(?:новые|подходящие)\s+вакансии\s+для\s+резюме:\s*[«\"]?([^»\"\n]+)",
+            r"recommended jobs for resume:\s*[«\"]?([^»\"\n]+)",
+        ],
+        value,
+    )
+    return normalize_entity(title or "")
+
+
+def facancy_section_title(line: str) -> str:
+    lowered = line.lower().strip(" .:")
+    if "лучшие для вас вакансии" in lowered:
+        return "лучшие для вас вакансии"
+    if "хорошие для вас вакансии" in lowered:
+        return "хорошие для вас вакансии"
+    if "любопытно посмотреть" in lowered:
+        return "любопытно посмотреть"
+    if "показать вашим детям" in lowered:
+        return "рекомендуем показать детям"
+    return ""
+
+
+def split_facancy_title_company(value: str) -> tuple[str, str]:
+    cleaned = normalize_entity(value)
+    patterns = [
+        r"^(.+?)\s+в\s+(российскую\s+IT-компанию)$",
+        r"^(.+?)\s+в\s+(IT-компанию(?:\s+.+)?)$",
+        r"^(.+?)\s+в\s+(образовательную\s+компанию\s+.+)$",
+        r"^(.+?)\s+в\s+(бренд\s+.+)$",
+        r"^(.+?)\s+в\s+(систему\s+.+)$",
+        r"^(.+?)\s+в\s+(туристическую\s+компанию\s+.+)$",
+        r"^(.+?)\s+в\s+(команду\s+.+)$",
+        r"^(.+?)\s+в\s+([A-ZА-ЯЁ0-9][^\n]+)$",
+        r"^(.+?)\s+от\s+(.+)$",
+    ]
+    for pattern in patterns:
+        match = re.match(pattern, cleaned)
+        if match:
+            return normalize_entity(match.group(1)), normalize_entity(match.group(2))
+    return cleaned, ""
+
+
+def parse_facancy_digest(lines: list[str]) -> list[dict[str, str]]:
+    candidates: list[dict[str, str]] = []
+    current_section = ""
+    idx = 0
+    while idx < len(lines):
+        line = normalize_entity(lines[idx])
+        section = facancy_section_title(line)
+        if section:
+            current_section = section
+            idx += 1
+            continue
+        if looks_like_footer_line(line) or "посмотреть все вакансии" in line.lower():
+            break
+        if line.startswith("•"):
+            raw_title = normalize_entity(line.lstrip("• "))
+            title, company = split_facancy_title_company(raw_title)
+            tags: list[str] = []
+            next_idx = idx + 1
+            while next_idx < len(lines):
+                next_line = normalize_entity(lines[next_idx])
+                if not next_line or next_line.startswith("•") or facancy_section_title(next_line) or looks_like_footer_line(next_line):
+                    break
+                if len(next_line) <= 120:
+                    tags.append(next_line)
+                next_idx += 1
+            description_parts = [
+                f"Категория Facancy: {current_section}" if current_section else "",
+                f"Исходная строка: {raw_title}",
+                f"Метки: {'; '.join(tags)}" if tags else "",
+            ]
+            candidates.append(
+                {
+                    "title": title,
+                    "company": company,
+                    "salary": "",
+                    "description": normalize_text("\n".join(part for part in description_parts if part)),
+                }
+            )
+            idx = next_idx
+            continue
+        idx += 1
+    return candidates
+
+
+def parse_vacancy_digest(subject: str, sender: str, body: str) -> dict[str, Any]:
+    source = detect_source(subject, sender, body)
+    resume_title = extract_digest_resume_title(subject, body)
+    lines = compact_lines(body)
+    if source == "facancy":
+        return {
+            "source": source,
+            "resume_title": resume_title,
+            "vacancies": parse_facancy_digest(lines),
+        }
+
+    start_idx = 0
+    for idx, line in enumerate(lines):
+        lowered = line.lower()
+        if "вакансии для резюме" in lowered or "recommended jobs" in lowered:
+            start_idx = idx + 1
+            break
+
+    candidates: list[dict[str, str]] = []
+    idx = start_idx
+    while idx < len(lines):
+        line = normalize_entity(lines[idx])
+        if not line:
+            idx += 1
+            continue
+        if looks_like_footer_line(line):
+            break
+        if looks_like_salary_line(line):
+            idx += 1
+            continue
+
+        title = line
+        idx += 1
+        salary = ""
+        company = ""
+        if idx < len(lines) and looks_like_salary_line(lines[idx]):
+            salary = normalize_entity(lines[idx])
+            idx += 1
+        if idx < len(lines) and not looks_like_footer_line(lines[idx]):
+            company_candidate = normalize_entity(lines[idx])
+            if not looks_like_salary_line(company_candidate):
+                company = company_candidate
+                idx += 1
+        if 3 <= len(title) <= 160:
+            candidates.append({"title": title, "company": company, "salary": salary})
+
+    return {
+        "source": source,
+        "resume_title": resume_title,
+        "vacancies": candidates,
+    }
+
+
+def enrich_hh_digest_vacancy(title: str, company: str) -> dict[str, Any] | None:
+    query = " ".join(part for part in [title, company] if part).strip()
+    if not query:
+        return None
+    try:
+        result = hh_public_get("/vacancies", {"text": query, "per_page": 3})
+    except HTTPException:
+        return None
+    items = result.get("items", []) if isinstance(result, dict) else []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        item_title = str(item.get("name", "") or "").lower()
+        employer = item.get("employer") if isinstance(item.get("employer"), dict) else {}
+        employer_name = str(employer.get("name", "") or "").lower()
+        title_ok = title.lower() in item_title or item_title in title.lower()
+        company_ok = not company or company.lower() in employer_name or employer_name in company.lower()
+        if title_ok and company_ok:
+            vacancy_id = str(item.get("id", "") or "")
+            if vacancy_id:
+                return hh_public_get(f"/vacancies/{urllib.parse.quote(vacancy_id)}")
+    if items and isinstance(items[0], dict) and items[0].get("id"):
+        return hh_public_get(f"/vacancies/{urllib.parse.quote(str(items[0]['id']))}")
+    return None
+
+
+def vacancies_for_company(company_name: str | None, limit: int = 8) -> list[dict[str, Any]]:
+    if not company_name:
+        return []
+    with connect() as conn:
+        rows = conn.execute(
+            "SELECT * FROM company_vacancies WHERE lower(company_name) = lower(?) OR lower(employer_name) = lower(?) ORDER BY id DESC LIMIT ?",
+            (company_name, company_name, limit),
+        ).fetchall()
+    return [vacancy_payload(dict(row)) for row in rows]
 
 
 def vacancy_text_for_company(company_name: str | None) -> str:
@@ -1240,11 +2188,13 @@ def match_cv_types(event: sqlite3.Row | dict[str, Any]) -> list[dict[str, Any]]:
 
 def match_hh_resumes(event: sqlite3.Row | dict[str, Any]) -> list[dict[str, Any]]:
     resume_title = str(event.get("resume_title", "") if isinstance(event, dict) else event["resume_title"] or "")
+    company_name = event.get("company_name") if isinstance(event, dict) else event["company_name"]
     source_text = "\n".join(
         [
             resume_title,
             str(event.get("subject", "") if isinstance(event, dict) else event["subject"] or ""),
             str(event.get("raw_text", "") if isinstance(event, dict) else event["raw_text"] or ""),
+            vacancy_text_for_company(company_name),
         ]
     )
     event_tokens = tokens(source_text)
@@ -1270,6 +2220,7 @@ def match_hh_resumes(event: sqlite3.Row | dict[str, Any]) -> list[dict[str, Any]
 
 def row_to_event(row: sqlite3.Row) -> dict[str, Any]:
     event = dict(row)
+    event["related_vacancies"] = vacancies_for_company(event.get("company_name"))
     event["cv_type_matches"] = match_cv_types(row)
     event["hh_resume_matches"] = match_hh_resumes(row)
     event["best_match"] = (
@@ -1303,9 +2254,25 @@ def linkedin_config() -> dict[str, Any]:
     }
 
 
-def latest_linkedin_account() -> dict[str, Any] | None:
+def hh_config() -> dict[str, Any]:
+    client_id = getenv_any("HH_CLIENT_ID", "hh_client_id")
+    client_secret = getenv_any("HH_CLIENT_SECRET", "hh_client_secret")
+    redirect_uri = getenv_any(
+        "HH_REDIRECT_URI",
+        "hh_redirect_uri",
+        default="http://localhost:8787/api/channels/hh/oauth/callback",
+    )
+    return {
+        "client_id": client_id,
+        "client_secret": client_secret,
+        "redirect_uri": redirect_uri,
+        "configured": bool(client_id and client_secret and redirect_uri),
+    }
+
+
+def latest_channel_account(channel: str) -> dict[str, Any] | None:
     with connect() as conn:
-        row = conn.execute("SELECT * FROM channel_accounts WHERE channel = ?", ("linkedin",)).fetchone()
+        row = conn.execute("SELECT * FROM channel_accounts WHERE channel = ?", (channel,)).fetchone()
     if row is None:
         return None
     account = dict(row)
@@ -1313,8 +2280,139 @@ def latest_linkedin_account() -> dict[str, Any] | None:
     return account
 
 
-def request_json(url: str, *, data: dict[str, str] | None = None, access_token: str | None = None) -> dict[str, Any]:
+def latest_linkedin_account() -> dict[str, Any] | None:
+    return latest_channel_account("linkedin")
+
+
+def token_expires_at(token_response: dict[str, Any]) -> str:
+    expires_in = int(token_response.get("expires_in", 0) or 0)
+    if expires_in <= 0:
+        return ""
+    # Keep a small safety margin so API calls do not race token expiry.
+    return (datetime.now(timezone.utc) + timedelta(seconds=max(0, expires_in - 60))).isoformat()
+
+
+def save_channel_token(channel: str, token_response: dict[str, Any]) -> None:
+    access_token = str(token_response.get("access_token", "")).strip()
+    if not access_token:
+        return
+    refresh_token = str(token_response.get("refresh_token", "")).strip()
+    now = utc_now()
+    with connect() as conn:
+        existing = conn.execute("SELECT * FROM channel_tokens WHERE channel = ?", (channel,)).fetchone()
+        created_at = existing["created_at"] if existing else now
+        if not refresh_token and existing:
+            refresh_token = str(existing["refresh_token"] or "")
+        conn.execute(
+            """
+            INSERT INTO channel_tokens (
+                channel, created_at, updated_at, access_token, refresh_token,
+                expires_at, raw_token
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                access_token = excluded.access_token,
+                refresh_token = excluded.refresh_token,
+                expires_at = excluded.expires_at,
+                raw_token = excluded.raw_token
+            """,
+            (
+                channel,
+                created_at,
+                now,
+                access_token,
+                refresh_token,
+                token_expires_at(token_response),
+                json.dumps(token_response, ensure_ascii=False),
+            ),
+        )
+
+
+def latest_channel_token(channel: str) -> dict[str, Any] | None:
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM channel_tokens WHERE channel = ?", (channel,)).fetchone()
+    return dict(row) if row else None
+
+
+def token_is_current(token: dict[str, Any]) -> bool:
+    expires_at = str(token.get("expires_at", "") or "")
+    if not expires_at:
+        return True
+    try:
+        return datetime.fromisoformat(expires_at) > datetime.now(timezone.utc)
+    except ValueError:
+        return False
+
+
+def hh_access_token() -> str:
+    token = latest_channel_token("hh")
+    if token and token_is_current(token):
+        return str(token["access_token"])
+
+    refresh_token = str((token or {}).get("refresh_token", "") or "")
+    if not refresh_token:
+        raise HTTPException(status_code=401, detail="HH токен не сохранён. Переподключите HH на вкладке “Каналы”.")
+
+    config = hh_config()
+    token_response = request_json(
+        HH_TOKEN_URL,
+        data={
+            "grant_type": "refresh_token",
+            "refresh_token": refresh_token,
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+        },
+        provider="HH",
+    )
+    save_channel_token("hh", token_response)
+    return str(token_response["access_token"])
+
+
+def hh_application_access_token() -> str:
+    token = latest_channel_token("hh_app")
+    if token and token_is_current(token):
+        return str(token["access_token"])
+
+    config = hh_config()
+    if not config["client_id"] or not config["client_secret"]:
+        raise HTTPException(
+            status_code=400,
+            detail="Для поиска вакансий HH нужны HH_CLIENT_ID и HH_CLIENT_SECRET для application token.",
+        )
+    token_response = request_json(
+        HH_TOKEN_URL,
+        data={
+            "grant_type": "client_credentials",
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+        },
+        provider="HH",
+    )
+    save_channel_token("hh_app", token_response)
+    return str(token_response["access_token"])
+
+
+def hh_public_get(path: str, params: dict[str, Any] | None = None) -> dict[str, Any]:
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    return request_json(
+        f"https://api.hh.ru{path}{query}",
+        access_token=hh_application_access_token(),
+        provider="HH",
+    )
+
+
+def request_json(
+    url: str,
+    *,
+    data: dict[str, str] | None = None,
+    access_token: str | None = None,
+    provider: str = "API",
+) -> dict[str, Any]:
     headers = {"Accept": "application/json"}
+    if provider.lower() == "hh":
+        headers["User-Agent"] = HH_USER_AGENT
+        headers["HH-User-Agent"] = HH_USER_AGENT
     payload = None
     if data is not None:
         payload = urllib.parse.urlencode(data).encode("utf-8")
@@ -1328,15 +2426,398 @@ def request_json(url: str, *, data: dict[str, str] | None = None, access_token: 
             body = response.read().decode("utf-8")
     except urllib.error.HTTPError as exc:
         detail = exc.read().decode("utf-8", errors="replace")
-        raise HTTPException(status_code=502, detail=f"LinkedIn API error: {detail}") from exc
+        raise HTTPException(status_code=502, detail=f"{provider} API error: {detail}") from exc
     except urllib.error.URLError as exc:
-        raise HTTPException(status_code=502, detail=f"LinkedIn API unavailable: {exc}") from exc
+        raise HTTPException(status_code=502, detail=f"{provider} API unavailable: {exc}") from exc
     return json.loads(body)
+
+
+def request_json_probe(
+    path: str,
+    *,
+    access_token: str | None = None,
+    params: dict[str, Any] | None = None,
+    label: str,
+    note: str = "",
+    skipped: str = "",
+) -> dict[str, Any]:
+    if skipped:
+        return {
+            "label": label,
+            "path": path,
+            "ok": False,
+            "skipped": True,
+            "note": skipped,
+        }
+
+    query = f"?{urllib.parse.urlencode(params)}" if params else ""
+    headers = {
+        "Accept": "application/json",
+        "User-Agent": HH_USER_AGENT,
+        "HH-User-Agent": HH_USER_AGENT,
+    }
+    if access_token:
+        headers["Authorization"] = f"Bearer {access_token}"
+
+    request = urllib.request.Request(f"https://api.hh.ru{path}{query}", headers=headers)
+    try:
+        with urllib.request.urlopen(request, timeout=20) as response:
+            status_code = response.status
+            raw_body = response.read().decode("utf-8")
+    except urllib.error.HTTPError as exc:
+        status_code = exc.code
+        raw_body = exc.read().decode("utf-8", errors="replace")
+    except urllib.error.URLError as exc:
+        return {
+            "label": label,
+            "path": path,
+            "ok": False,
+            "status_code": None,
+            "note": note,
+            "error": f"HH API unavailable: {exc}",
+        }
+
+    try:
+        body: Any = json.loads(raw_body)
+    except json.JSONDecodeError:
+        body = raw_body[:4000]
+
+    request_id = ""
+    if isinstance(body, dict):
+        request_id = str(body.get("request_id", "") or "")
+
+    return {
+        "label": label,
+        "path": path,
+        "ok": 200 <= status_code < 300,
+        "status_code": status_code,
+        "note": note,
+        "request_id": request_id,
+        "body": body,
+    }
 
 
 @app.get("/api/health")
 def health() -> dict[str, str]:
     return {"status": "ok"}
+
+
+@app.get("/api/channels/hh/status")
+def hh_status() -> dict[str, Any]:
+    config = hh_config()
+    account = latest_channel_account("hh")
+    token = latest_channel_token("hh")
+    return {
+        "channel": "hh",
+        "configured": config["configured"],
+        "missing": [
+            name
+            for name, value in {
+                "HH_CLIENT_ID": config["client_id"],
+                "HH_CLIENT_SECRET": config["client_secret"],
+                "HH_REDIRECT_URI": config["redirect_uri"],
+            }.items()
+            if not value
+        ],
+        "redirect_uri": config["redirect_uri"],
+        "connected": account is not None,
+        "token_saved": token is not None,
+        "sync_ready": account is not None and token is not None,
+        "applicant_api_supported": False,
+        "applicant_api_note": (
+            "HH прекратил поддержку соискательского API: работа с резюме и откликами от лица соискателя через API недоступна. "
+            "Доступны поиск и просмотр вакансий с токеном приложения."
+        ),
+        "account": account,
+    }
+
+
+@app.get("/api/channels/hh/diagnostics")
+def hh_diagnostics() -> dict[str, Any]:
+    status = hh_status()
+    probes: list[dict[str, Any]] = []
+    recommendations: list[str] = []
+    access_token = ""
+    try:
+        access_token = hh_access_token()
+    except HTTPException as exc:
+        recommendations.append(str(exc.detail))
+
+    me_body: dict[str, Any] = {}
+    if access_token:
+        me_probe = request_json_probe(
+            "/me",
+            access_token=access_token,
+            label="Профиль текущего пользователя",
+            note="Базовая проверка сохраненного OAuth-токена HH.",
+        )
+        probes.append(me_probe)
+        if me_probe.get("ok") and isinstance(me_probe.get("body"), dict):
+            me_body = me_probe["body"]
+
+        resumes_probe = request_json_probe(
+            "/resumes/mine",
+            access_token=access_token,
+            label="Собственные резюме соискателя",
+            note="Историческая проверка: HH официально прекратил поддержку соискательского API, 403 здесь ожидаем.",
+        )
+        probes.append(resumes_probe)
+        if not resumes_probe.get("ok"):
+            recommendations.append(
+                "HH подтвердил прекращение поддержки соискательского API: /resumes/mine, резюме и отклики от лица соискателя недоступны. "
+                "Используем локальный импорт/редактирование резюме и письма HH как источник событий."
+            )
+
+    employer = me_body.get("employer") if isinstance(me_body.get("employer"), dict) else {}
+    manager = me_body.get("manager") if isinstance(me_body.get("manager"), dict) else {}
+    employer_id = str(employer.get("id") or me_body.get("employer_id") or "")
+    manager_id = str(manager.get("id") or me_body.get("manager_id") or "")
+    if access_token and employer_id:
+        probes.append(
+            request_json_probe(
+                f"/employers/{urllib.parse.quote(employer_id)}/services/payable_api_actions/active",
+                access_token=access_token,
+                label="Активные услуги API для платных методов",
+                note="Employer paid API: активные услуги для платных методов резюме.",
+            )
+        )
+    else:
+        probes.append(
+            request_json_probe(
+                "/employers/{employer_id}/services/payable_api_actions/active",
+                label="Активные услуги API для платных методов",
+                skipped="В /me нет employer_id: текущий HH OAuth авторизован как соискатель, не как менеджер работодателя.",
+            )
+        )
+
+    if access_token and employer_id and manager_id:
+        probes.append(
+            request_json_probe(
+                (
+                    f"/employers/{urllib.parse.quote(employer_id)}"
+                    f"/managers/{urllib.parse.quote(manager_id)}/method_access"
+                ),
+                access_token=access_token,
+                label="Доступ менеджера к платным методам",
+                note="Employer paid API: проверка групп платного доступа для конкретного менеджера.",
+            )
+        )
+    else:
+        probes.append(
+            request_json_probe(
+                "/employers/{employer_id}/managers/{manager_id}/method_access",
+                label="Доступ менеджера к платным методам",
+                skipped="В /me нет employer_id/manager_id: проверка доступна только для OAuth менеджера работодателя.",
+            )
+        )
+
+    if me_body.get("auth_type") == "applicant":
+        recommendations.append(
+            "Текущий токен имеет auth_type=applicant. После закрытия соискательского API он не дает доступ к резюме/откликам; "
+            "для HH остаются вакансии по application token и локальная работа с резюме."
+        )
+
+    return {
+        "channel": "hh",
+        "checked_at": utc_now(),
+        "status": status,
+        "identity": {
+            "auth_type": me_body.get("auth_type", ""),
+            "is_applicant": bool(me_body.get("is_applicant")),
+            "is_employer": bool(me_body.get("is_employer")),
+            "is_application": bool(me_body.get("is_application")),
+            "resumes_count": me_body.get("counters", {}).get("resumes_count") if isinstance(me_body.get("counters"), dict) else None,
+            "resumes_url": me_body.get("resumes_url", ""),
+            "employer_id": employer_id,
+            "manager_id": manager_id,
+        },
+        "probes": probes,
+        "recommendations": recommendations,
+    }
+
+
+@app.get("/api/channels/hh/connect")
+def hh_connect() -> RedirectResponse:
+    config = hh_config()
+    if not config["configured"]:
+        raise HTTPException(status_code=400, detail="HH OAuth не настроен: нужны client id, client secret и redirect uri")
+
+    state = secrets.token_urlsafe(32)
+    with connect() as conn:
+        conn.execute(
+            "INSERT INTO oauth_states (state, channel, created_at) VALUES (?, ?, ?)",
+            (state, "hh", utc_now()),
+        )
+
+    query = urllib.parse.urlencode(
+        {
+            "response_type": "code",
+            "client_id": config["client_id"],
+            "redirect_uri": config["redirect_uri"],
+            "state": state,
+        }
+    )
+    return RedirectResponse(f"{HH_AUTH_URL}?{query}")
+
+
+@app.get("/api/channels/hh/oauth/callback", response_class=HTMLResponse)
+def hh_oauth_callback(
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+    error_description: str | None = None,
+) -> HTMLResponse:
+    if error:
+        message = html.escape(error_description or error)
+        return HTMLResponse(f"<h1>HH connection failed</h1><p>{message}</p>", status_code=400)
+    if not code or not state:
+        raise HTTPException(status_code=400, detail="HH не вернул code/state")
+
+    with connect() as conn:
+        row = conn.execute("SELECT * FROM oauth_states WHERE state = ? AND channel = ?", (state, "hh")).fetchone()
+        if row is None:
+            raise HTTPException(status_code=400, detail="Некорректный OAuth state")
+        conn.execute("DELETE FROM oauth_states WHERE state = ?", (state,))
+
+    config = hh_config()
+    token_response = request_json(
+        HH_TOKEN_URL,
+        data={
+            "grant_type": "authorization_code",
+            "code": code,
+            "redirect_uri": config["redirect_uri"],
+            "client_id": config["client_id"],
+            "client_secret": config["client_secret"],
+        },
+        provider="HH",
+    )
+    access_token = token_response.get("access_token")
+    if not access_token:
+        raise HTTPException(status_code=502, detail="HH не вернул access_token")
+    save_channel_token("hh", token_response)
+
+    profile = request_json(HH_ME_URL, access_token=str(access_token), provider="HH")
+    now = utc_now()
+    name = " ".join(
+        value
+        for value in [
+            str(profile.get("first_name", "")).strip(),
+            str(profile.get("last_name", "")).strip(),
+        ]
+        if value
+    ) or str(profile.get("name", "") or profile.get("id", ""))
+    with connect() as conn:
+        conn.execute(
+            """
+            INSERT INTO channel_accounts (
+                channel, created_at, updated_at, profile_id, name, email,
+                picture_url, profile_url, raw_profile
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+            ON CONFLICT(channel) DO UPDATE SET
+                updated_at = excluded.updated_at,
+                profile_id = excluded.profile_id,
+                name = excluded.name,
+                email = excluded.email,
+                picture_url = excluded.picture_url,
+                profile_url = excluded.profile_url,
+                raw_profile = excluded.raw_profile
+            """,
+            (
+                "hh",
+                now,
+                now,
+                str(profile.get("id", "")),
+                name,
+                str(profile.get("email", "")),
+                str(profile.get("photo", "")),
+                str(profile.get("alternate_url", "")),
+                json.dumps(profile, ensure_ascii=False),
+            ),
+        )
+
+    safe_name = html.escape(name or "HH profile")
+    return HTMLResponse(
+        f"""
+        <!doctype html>
+        <html lang="ru">
+        <head>
+          <meta charset="utf-8">
+          <title>HH подключён</title>
+          <script>
+            setTimeout(() => {{
+              if (window.opener) {{
+                window.close();
+              }}
+            }}, 2500);
+          </script>
+        </head>
+        <body>
+          <h1>HH подключён</h1>
+          <p>Профиль сохранён: {safe_name}</p>
+          <p>Данные сохранены локально в Resume Intel. Можно закрыть это окно и вернуться на вкладку "Каналы".</p>
+          <p><a href="http://localhost:5177">Вернуться в приложение</a></p>
+        </body>
+        </html>
+        """
+    )
+
+
+@app.post("/api/channels/hh/sync-resumes")
+def hh_sync_resumes() -> dict[str, Any]:
+    access_token = hh_access_token()
+    try:
+        resumes_response = hh_api_get("/resumes/mine", access_token=access_token)
+    except HTTPException as exc:
+        detail = str(exc.detail)
+        if "forbidden" in detail.lower():
+            raise HTTPException(
+                status_code=403,
+                detail=(
+                    "HH подтвердил прекращение поддержки соискательского API: /resumes/mine, резюме и отклики "
+                    "от лица соискателя через API недоступны. Используйте импорт из файла, локальное редактирование "
+                    f"и события из писем HH. Исходный ответ: {detail}"
+                ),
+            ) from exc
+        raise
+    items = resumes_response.get("items", resumes_response if isinstance(resumes_response, list) else [])
+    if not isinstance(items, list):
+        raise HTTPException(status_code=502, detail="HH API вернул неожиданный формат списка резюме")
+
+    synced = []
+    errors = []
+    for short_resume in items:
+        if not isinstance(short_resume, dict):
+            continue
+        resume_id = str(short_resume.get("id", "") or "")
+        if not resume_id:
+            continue
+        try:
+            detail = hh_api_get(f"/resumes/{urllib.parse.quote(resume_id)}", access_token=access_token)
+            if not isinstance(detail, dict):
+                detail = short_resume
+        except HTTPException as exc:
+            errors.append({"id": resume_id, "detail": exc.detail})
+            detail = short_resume
+        saved = save_hh_api_resume({**short_resume, **detail})
+        synced.append(
+            {
+                "id": saved["id"],
+                "title": saved["title"],
+                "external_id": saved["external_id"],
+                "url": saved.get("url", ""),
+                "updated_at": saved["updated_at"],
+                "api_updated_at": saved.get("api_updated_at", ""),
+            }
+        )
+
+    return {
+        "channel": "hh",
+        "synced": len(synced),
+        "found": int(resumes_response.get("found", len(items)) or len(items)) if isinstance(resumes_response, dict) else len(items),
+        "items": synced,
+        "errors": errors,
+    }
 
 
 @app.get("/api/channels/linkedin/status")
@@ -1416,12 +2897,13 @@ def linkedin_oauth_callback(
             "client_id": config["client_id"],
             "client_secret": config["client_secret"],
         },
+        provider="LinkedIn",
     )
     access_token = token_response.get("access_token")
     if not access_token:
         raise HTTPException(status_code=502, detail="LinkedIn не вернул access_token")
 
-    profile = request_json(LINKEDIN_USERINFO_URL, access_token=str(access_token))
+    profile = request_json(LINKEDIN_USERINFO_URL, access_token=str(access_token), provider="LinkedIn")
     now = utc_now()
     with connect() as conn:
         conn.execute(
@@ -1486,6 +2968,7 @@ def cv_types() -> list[dict[str, Any]]:
         {
             "slug": item["slug"],
             "title": item["title"],
+            "updated_at": datetime.fromtimestamp(float(item.get("updated_at", 0)), timezone.utc).isoformat(),
             "keywords": sorted(tokens(item["content"]))[:80],
         }
         for item in load_cv_types()
@@ -1500,6 +2983,11 @@ def cv_type_detail(slug: str) -> dict[str, Any]:
     return detail
 
 
+@app.put("/api/cv-types/{slug}/documents/{filename}")
+def update_cv_type_document(slug: str, filename: str, payload: CvDocumentInput) -> dict[str, Any]:
+    return save_cv_type_document(slug, filename, payload.content)
+
+
 @app.get("/api/hh-resumes")
 def hh_resumes() -> list[dict[str, Any]]:
     return [
@@ -1508,11 +2996,13 @@ def hh_resumes() -> list[dict[str, Any]]:
             "title": item["title"],
             "status": item["status"],
             "channel": item["channel"],
+            "source": item["source"],
             "external_id": item["external_id"],
             "url": item["url"],
             "notes": item["notes"],
             "source_filename": item["source_filename"],
             "updated_at": item["updated_at"],
+            "api_updated_at": item["api_updated_at"],
             "keywords": resume_keywords(find_hh_resume_by_id(item["id"]) or {}, content=item["content"], limit=40),
         }
         for item in load_hh_resumes()
@@ -1525,6 +3015,32 @@ def hh_resume_detail(resume_id: str) -> dict[str, Any]:
     if item is None:
         raise HTTPException(status_code=404, detail="HH-резюме не найдено")
     return hh_resume_detail_payload(item)
+
+
+@app.put("/api/hh-resumes/{resume_id}/content")
+def update_hh_resume_content(resume_id: str, payload: ResumeContentInput) -> dict[str, Any]:
+    item = find_hh_resume_by_id(resume_id)
+    if item is None:
+        raise HTTPException(status_code=404, detail="Резюме не найдено")
+    raw_text = payload.content.rstrip() + "\n"
+    if len(raw_text.strip()) < 40:
+        raise HTTPException(status_code=422, detail="Слишком мало текста для сохранения резюме")
+
+    channel = str(item.get("channel", "hh"))
+    parsed_structure = parse_resume_for_channel(channel, raw_text, str(item.get("title", "")))
+    title = str(parsed_structure.get("title", "")).strip() or str(item.get("title", "")).strip()
+    now = utc_now()
+    updated = {
+        **item,
+        "title": title,
+        "keywords": " ".join(resume_keywords(item, parsed_structure, raw_text, 120)),
+        "raw_text": raw_text,
+        "parsed_structure": parsed_structure,
+        "updated_at": now,
+        "notes": f"{item.get('notes', '')}\nОтредактировано вручную {now}".strip(),
+    }
+    save_hh_resume(updated)
+    return hh_resume_detail_payload(updated)
 
 
 @app.post("/api/hh-resumes/{resume_id}/reparse")
@@ -1671,18 +3187,11 @@ async def import_email(file: UploadFile = File(...)) -> dict[str, Any]:
 
 @app.post("/api/import/native-mail")
 def import_native_mail(message: NativeMailInput) -> dict[str, Any]:
-    raw_body = normalize_text(message.body)
-    if looks_like_rfc822(raw_body):
-        decoded = decode_upload(message.raw_filename, raw_body.encode("utf-8", errors="replace"))
-        subject = decoded["subject"] or message.subject.strip() or first_subject_line(decoded["body"])
-        sender = decoded["sender"] or message.sender.strip()
-        sent_at = decoded["sent_at"] or message.sent_at
-        body = normalize_text(decoded["body"])
-    else:
-        subject = message.subject.strip() or first_subject_line(raw_body)
-        sender = message.sender.strip()
-        sent_at = message.sent_at
-        body = raw_body
+    decoded = decode_native_mail_message(message)
+    subject = decoded["subject"]
+    sender = decoded["sender"]
+    sent_at = decoded["sent_at"]
+    body = decoded["body"]
 
     if not body:
         raise HTTPException(status_code=400, detail="Пустое письмо")
@@ -1721,6 +3230,109 @@ def import_native_mail(message: NativeMailInput) -> dict[str, Any]:
     return row_to_event(row)
 
 
+@app.post("/api/vacancies/import/native-mail")
+def import_vacancy_digest_native_mail(message: NativeMailInput) -> dict[str, Any]:
+    decoded = decode_native_mail_message(message)
+    subject = decoded["subject"]
+    sender = decoded["sender"]
+    sent_at = decoded["sent_at"]
+    body = decoded["body"]
+    if not body:
+        raise HTTPException(status_code=400, detail="Пустое письмо")
+
+    digest = parse_vacancy_digest(subject, sender, body)
+    source = digest["source"]
+    resume_title = digest["resume_title"]
+    recommended_profile = resolve_recommended_profile(resume_title)
+    now = utc_now()
+    with connect() as conn:
+        cursor = conn.execute(
+            """
+            INSERT INTO email_events (
+                created_at, source, event_type, subject, sender, sent_at, company_name,
+                resume_title, confidence, raw_text, raw_filename
+            ) VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            (
+                now,
+                source,
+                "recommended_jobs",
+                subject,
+                sender,
+                sent_at,
+                "",
+                resume_title,
+                0.85 if digest["vacancies"] else 0.35,
+                body,
+                decoded["raw_filename"],
+            ),
+        )
+        event_id = cursor.lastrowid
+        row = conn.execute("SELECT * FROM email_events WHERE id = ?", (event_id,)).fetchone()
+
+    saved = []
+    errors = []
+    recommendation_fields = {
+        "import_event_id": event_id,
+        **recommended_profile,
+    }
+    for item in digest["vacancies"]:
+        title = item["title"]
+        company = item["company"]
+        salary = item["salary"]
+        parsed_description = item.get("description", "")
+        try:
+            enriched = enrich_hh_digest_vacancy(title, company) if source == "hh" else None
+            if enriched:
+                enriched_payload = hh_vacancy_payload(enriched)
+                raw_meta = json.loads(enriched_payload.get("raw_json") or "{}")
+                raw_meta.update(
+                    {
+                        "mail_subject": subject,
+                        "raw_filename": decoded["raw_filename"],
+                        "recommended_resume_title": resume_title,
+                        "import_event_id": event_id,
+                    }
+                )
+                enriched_payload["raw_json"] = json.dumps(raw_meta, ensure_ascii=False)
+                saved.append(save_company_vacancy({**enriched_payload, **recommendation_fields}))
+            else:
+                saved.append(
+                    save_company_vacancy(
+                        {
+                            "source": source if source != "unknown" else "mail_digest",
+                            "company_name": company or "Компания не определена",
+                            "employer_name": company or "Компания не определена",
+                            "title": title,
+                            "salary": salary,
+                            "description": "\n".join(part for part in [title, company, salary, parsed_description, resume_title, subject] if part),
+                            "raw_json": json.dumps(
+                                {
+                                    "mail_subject": subject,
+                                    "raw_filename": decoded["raw_filename"],
+                                    "recommended_resume_title": resume_title,
+                                    "import_event_id": event_id,
+                                    "parsed": item,
+                                },
+                                ensure_ascii=False,
+                            ),
+                            **recommendation_fields,
+                        }
+                    )
+                )
+        except Exception as exc:
+            errors.append({"title": title, "company": company, "error": str(exc)})
+
+    return {
+        "event": row_to_event(row),
+        "resume_title": resume_title,
+        "recommended_profile": build_recommended_profile(recommendation_fields),
+        "parsed": len(digest["vacancies"]),
+        "saved": saved,
+        "errors": errors,
+    }
+
+
 @app.get("/api/events")
 def events() -> list[dict[str, Any]]:
     with connect() as conn:
@@ -1737,20 +3349,76 @@ def event(event_id: int) -> dict[str, Any]:
     return row_to_event(row)
 
 
+@app.get("/api/channels/hh/vacancies/search")
+def hh_vacancy_search(
+    text: str = "",
+    company: str = "",
+    area: str = "",
+    page: int = 0,
+    per_page: int = 20,
+) -> dict[str, Any]:
+    query_text = " ".join(part for part in [company.strip(), text.strip()] if part)
+    if not query_text:
+        raise HTTPException(status_code=400, detail="Укажите текст поиска или компанию")
+    params: dict[str, Any] = {
+        "text": query_text,
+        "page": max(0, page),
+        "per_page": min(max(1, per_page), 50),
+    }
+    if area:
+        params["area"] = area
+    result = hh_public_get("/vacancies", params)
+    items = result.get("items", []) if isinstance(result, dict) else []
+    normalized_items = []
+    for item in items if isinstance(items, list) else []:
+        if not isinstance(item, dict):
+            continue
+        payload = hh_vacancy_payload(item)
+        payload["snippet"] = item.get("snippet", {})
+        payload["employer"] = item.get("employer", {})
+        normalized_items.append(payload)
+    return {
+        "source": "hh_api",
+        "query": query_text,
+        "found": result.get("found", len(normalized_items)) if isinstance(result, dict) else len(normalized_items),
+        "page": result.get("page", page) if isinstance(result, dict) else page,
+        "pages": result.get("pages", 1) if isinstance(result, dict) else 1,
+        "items": normalized_items,
+    }
+
+
+@app.get("/api/channels/hh/vacancies/{vacancy_id}")
+def hh_vacancy_detail(vacancy_id: str) -> dict[str, Any]:
+    vacancy = hh_public_get(f"/vacancies/{urllib.parse.quote(vacancy_id)}")
+    return {
+        **hh_vacancy_payload(vacancy),
+        "raw": vacancy,
+    }
+
+
+@app.post("/api/channels/hh/vacancies/{vacancy_id}/save")
+def save_hh_vacancy(vacancy_id: str) -> dict[str, Any]:
+    vacancy = hh_public_get(f"/vacancies/{urllib.parse.quote(vacancy_id)}")
+    return save_company_vacancy(hh_vacancy_payload(vacancy))
+
+
+@app.get("/api/channels/hh/employers/{employer_id}")
+def hh_employer_detail(employer_id: str) -> dict[str, Any]:
+    return hh_public_get(f"/employers/{urllib.parse.quote(employer_id)}")
+
+
 @app.post("/api/vacancies")
 def add_vacancy(vacancy: VacancyInput) -> dict[str, Any]:
-    now = datetime.now(timezone.utc).isoformat()
-    with connect() as conn:
-        cursor = conn.execute(
-            """
-            INSERT INTO company_vacancies (created_at, company_name, title, url, description)
-            VALUES (?, ?, ?, ?, ?)
-            """,
-            (now, vacancy.company, vacancy.title, vacancy.url, vacancy.description),
-        )
-        vacancy_id = cursor.lastrowid
-        row = conn.execute("SELECT * FROM company_vacancies WHERE id = ?", (vacancy_id,)).fetchone()
-    return dict(row)
+    return save_company_vacancy(
+        {
+            "source": "manual",
+            "company_name": vacancy.company,
+            "employer_name": vacancy.company,
+            "title": vacancy.title,
+            "url": vacancy.url or "",
+            "description": vacancy.description,
+        }
+    )
 
 
 @app.get("/api/vacancies")
@@ -1763,4 +3431,4 @@ def vacancies(company: str | None = None) -> list[dict[str, Any]]:
             ).fetchall()
         else:
             rows = conn.execute("SELECT * FROM company_vacancies ORDER BY id DESC LIMIT 200").fetchall()
-    return [dict(row) for row in rows]
+    return [vacancy_payload(dict(row)) for row in rows]

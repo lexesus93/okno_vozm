@@ -10,10 +10,6 @@
 
 Мой сильный профиль — соединять технологическую экспертизу, управление командами, работу с руководителями бизнеса и доведение сложных инициатив до измеримого результата. Особенно полезен в ситуациях, где нужно структурировать неопределенность, согласовать интересы разных функций и не потерять практическую реализуемость решений.
 
-## Ключевые компетенции
-
-Professional IT Consulting, Data & AI consulting, enterprise transformation, as-is/to-be, reference architecture, roadmap, PMO, program management, delivery, presale, account strategy, C-level, stakeholder management, ROI, KPI, budget, change management, facilitation, workshops, business process transformation, CRM, BI, AI/ML, Data Governance, enterprise architecture
-
 ## Релевантный опыт и достижения
 
 - Астра: сформировал с нуля новое направление ИТ-консалтинга: бизнес-модель, методология, оргструктура, процессы и команда.
@@ -23,6 +19,10 @@ Professional IT Consulting, Data & AI consulting, enterprise transformation, as-
 - Teradata и Форсайт: client-facing работа с крупными заказчиками, стратегиями, ЛПР и развитием отношений вокруг технологических инициатив.
 - ND Group: создание PMO с нуля и управление проектами SAP MDM в банковском секторе и телекоме.
 - CNET: ранний опыт руководства разработкой ПО и взаимодействия с бизнес-заказчиками.
+
+## Ключевые компетенции
+
+Professional IT Consulting, Data & AI consulting, enterprise transformation, as-is/to-be, reference architecture, roadmap, PMO, program management, delivery, presale, account strategy, C-level, stakeholder management, ROI, KPI, budget, change management, facilitation, workshops, business process transformation, CRM, BI, AI/ML, Data Governance, enterprise architecture
 
 ## Профессиональный опыт
 

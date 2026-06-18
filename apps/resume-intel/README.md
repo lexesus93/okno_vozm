@@ -41,6 +41,45 @@ SQLite-база хранится локально:
 apps/resume-intel/data/resume_intel.sqlite3
 ```
 
+## HH OAuth
+
+Заявка на HH API одобрена, поэтому приложение может подключать HH через OAuth.
+
+В корневом `.env` нужны переменные:
+
+```text
+HH_CLIENT_ID=...
+HH_CLIENT_SECRET=...
+HH_REDIRECT_URI=http://localhost:8787/api/channels/hh/oauth/callback
+```
+
+`HH_REDIRECT_URI` должен полностью совпадать с redirect URI, указанным в настройках приложения в HH Developer Portal. Если сейчас там временный несуществующий URL, для реального подключения его нужно заменить.
+
+Для локальной разработки используйте:
+
+```text
+http://localhost:8787/api/channels/hh/oauth/callback
+```
+
+Если HH не принимает `localhost` или callback должен быть доступен из интернета, поднимите HTTPS-туннель через `ngrok` или `cloudflared` и укажите один и тот же публичный URL в `.env` и в HH Developer Portal:
+
+```text
+https://<public-host>/api/channels/hh/oauth/callback
+```
+
+После запуска откройте вкладку “Каналы” и нажмите “Подключить HH”. OAuth-подключение проверяет доступ через `https://api.hh.ru/me`, сохраняет базовый профиль и OAuth-токены локально в SQLite.
+
+Если HH был подключен до появления хранения токенов, нажмите “Переподключить HH” на вкладке “Каналы”, чтобы сохранить `refresh_token`. Без этого синхронизация резюме через API будет недоступна.
+
+На вкладке “Резюме” используйте “Синхронизировать из HH API”. Приложение вызывает:
+
+```text
+GET https://api.hh.ru/resumes/mine
+GET https://api.hh.ru/resumes/{resume_id}
+```
+
+Ответ HH сохраняется в локальный кэш `apps/resume-intel/config/hh_resumes.json`: нормализованные поля используются для текущего UI и matching, а полный ответ HH сохраняется в `raw_api_data`, чтобы не потерять дополнительные секции и элементы, которые мы пока не отображаем. Текущий импорт резюме файлами остается fallback-сценарием.
+
 ## Текущие HH-резюме
 
 3 CV-типа в `output/cv_types` — это проектные целевые версии, а не обязательно то, что уже опубликовано в HH.

@@ -12,7 +12,7 @@ services:
       - ./backend/app:/app/app
       - ./data:/app/data
       - ./config:/app/config
-      - ../../output:/workspace/output:ro
+      - ../../output:/workspace/output
     ports:
       - "8787:8787"
 

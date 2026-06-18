@@ -213,6 +213,10 @@ button:disabled {
   gap: 24px;
 }
 
+.resumes-layout {
+  grid-template-columns: 420px minmax(0, 1fr);
+}
+
 .page-grid {
   display: grid;
   gap: 22px;
@@ -413,6 +417,10 @@ button:disabled {
   margin: 8px 0;
 }
 
+.section-content {
+  white-space: pre-wrap;
+}
+
 .cv-type {
   border-top: 1px solid #e4e9f2;
   padding: 12px 0;
@@ -545,6 +553,49 @@ button:disabled {
   margin-top: 12px;
 }
 
+.resume-workbench-header {
+  align-items: center;
+  display: flex;
+  justify-content: space-between;
+  gap: 18px;
+}
+
+.operations-panel {
+  display: grid;
+  gap: 18px;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+
+.button-row {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 10px;
+}
+
+.diagnostic-grid {
+  display: grid;
+  gap: 16px;
+  grid-template-columns: repeat(4, minmax(0, 1fr));
+  margin-top: 18px;
+}
+
+.diagnostic-section {
+  margin-top: 22px;
+}
+
+.diagnostic-probes {
+  display: grid;
+  gap: 14px;
+  margin-top: 12px;
+}
+
+.diagnostic-card {
+  background: #f8fafd;
+  border: 1px solid #e2e8f2;
+  border-radius: 18px;
+  padding: 16px;
+}
+
 .linkedin-profile {
   align-items: center;
   display: flex;
@@ -575,12 +626,99 @@ pre {
   line-height: 1.6;
 }
 
+.markdown-document {
+  background: #ffffff;
+  border: 1px solid #e2e8f2;
+  border-radius: 18px;
+  line-height: 1.65;
+  margin-top: 12px;
+  padding: 20px;
+}
+
+.markdown-document h1,
+.markdown-document h2,
+.markdown-document h3,
+.markdown-document h4 {
+  color: #10203a;
+  line-height: 1.25;
+  margin: 22px 0 10px;
+}
+
+.markdown-document h1:first-child,
+.markdown-document h2:first-child,
+.markdown-document h3:first-child,
+.markdown-document h4:first-child {
+  margin-top: 0;
+}
+
+.markdown-document h1 {
+  font-size: 26px;
+}
+
+.markdown-document h2 {
+  border-top: 1px solid #e8edf5;
+  font-size: 20px;
+  padding-top: 18px;
+}
+
+.markdown-document h2:first-child {
+  border-top: 0;
+  padding-top: 0;
+}
+
+.markdown-document h3 {
+  font-size: 17px;
+}
+
+.markdown-document p {
+  margin: 8px 0 12px;
+}
+
+.markdown-document ul {
+  margin: 8px 0 16px;
+  padding-left: 22px;
+}
+
+.markdown-document li {
+  margin: 6px 0;
+}
+
+.editable-document {
+  margin-top: 12px;
+}
+
+.document-editor {
+  background: #ffffff;
+  border: 1px solid #cbd6e6;
+  border-radius: 18px;
+  color: #10203a;
+  font-family: "SFMono-Regular", Consolas, "Liberation Mono", monospace;
+  font-size: 14px;
+  line-height: 1.55;
+  min-height: 620px;
+  resize: vertical;
+  white-space: pre-wrap;
+}
+
+.structured-text p {
+  white-space: pre-wrap;
+}
+
 .vacancy-form {
   background: #fbfcff;
   border: 1px solid #e2e8f2;
   border-radius: 18px;
   margin-top: 20px;
   padding: 16px;
+}
+
+.vacancy-card .match-row {
+  align-items: flex-start;
+  gap: 12px;
+}
+
+.compact {
+  padding: 8px 12px;
 }
 
 input,
@@ -657,14 +795,22 @@ textarea {
 
   .content-layout,
   .channel-grid,
+  .diagnostic-grid,
   .import-form-grid,
+  .operations-panel,
   .section-index {
     grid-template-columns: 1fr;
+  }
+
+  .resume-workbench-header {
+    align-items: flex-start;
+    flex-direction: column;
   }
 }
 
 @media (max-width: 640px) {
   .nav,
+  .diagnostic-grid,
   .stats {
     grid-template-columns: 1fr;
   }

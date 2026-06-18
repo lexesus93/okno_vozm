@@ -2,35 +2,35 @@
 
 ## Ключевые навыки для HH
 
-AI adoption, Data adoption, AI Business Partner, LLM, RAG, AI agents, Cursor, CLINE, Python, React, Qdrant, vLLM, llama.cpp, Docker, on-prem LLM, GPU resources, API, automation, ROI, adoption metrics, DORA, AI champions, AI ambassadors, change management, workshops, business process analysis, IT/security alignment
+AI adoption, Data adoption, AI Business Partner, AI IT Partner, LLM, RAG, AI agents, MCP, AI skills, Cursor, CLINE, on-prem LLM, ROI, adoption metrics, stakeholder management, change management, AI champions, AI ambassadors, workshops, business process analysis, IT/security alignment, cross-functional coordination, product discovery, pilot to scale, platform adoption, engineering workflow, code review, CI/CD
 
 ## Требования, которые должен закрывать верх CV
 
 - Поиск AI/Data-сценариев через интервью с владельцами процессов и будущими пользователями.
 - Формулирование гипотез, запуск пилотов, измерение эффекта и масштабирование успешных практик.
 - ROI, baseline, adoption-метрики, DORA/engineering metrics или бизнес-метрики времени, качества, ошибок и экономии.
-- AI-амбассадоры / AI-чемпионы, обучение сотрудников, воркшопы и работа с сопротивлением изменениям.
-- LLM, RAG, AI-агенты, API, автоматизации, Cursor/CLINE, on-prem LLM, внутренние LLM-сервисы.
+- AI IT/Business Partner: представитель AI-направления для смежных команд, согласование приоритетов, снятие блокеров, управление зависимостями.
+- AI-амбассадоры / AI-чемпионы, обучение сотрудников, воркшопы, AI-культура и работа с сопротивлением изменениям.
+- LLM, RAG, AI-агенты, MCP, API, Cursor/CLINE, on-prem LLM, внутренние LLM-сервисы — на уровне понимания и оркестрации.
 - Взаимодействие с ИТ и ИБ: данные, безопасность, ограничения on-prem/cloud, доступы и эксплуатация.
 - Понимание инженерного workflow: code review, документация, тестирование, CI/CD, incident/support workflow.
 - Умение отличать хайп от реальной пользы и не внедрять AI ради AI.
 
 ## Доказательства, которые стоит поднимать выше
 
-- Форсайт: координация AI-инициатив на стыке разработки, внедрения, пресейла, поддержки и других функций.
-- Примеры инициатив: AI-помощник для службы технической поддержки и on-prem AI-ассистент для задач разработки.
-- В проекте AI-помощника выступал оркестратором работы в Cursor; стек включал Qdrant, vLLM, llama.cpp, Docker, Python, React, внутренние LLM-сервисы и GPU-ресурсы.
-- Для оценки adoption использовались дашборды и метрики применения AI-решений инженерами техподдержки и разработчиками.
-- Астра: анализ процессов компании и встраивание новой функции в операционную модель продаж, разработки, внедрения и поддержки.
-- IBM Data & AI и CNET дают техническую и управленческую базу для разговора с инженерными командами и бизнесом.
-- Дипломная и аспирантская работы были связаны с использованием нейронных сетей в САПР, до текущей волны LLM.
+- Форсайт: координация AI-инициатив на стыке разработки, внедрения, пресейла, поддержки; выявление AI-амбассадоров.
+- AI-помощник для техподдержки и on-prem AI-ассистент для инженерных workflow; метрики adoption через дашборды.
+- Оркестрация в Cursor; Qdrant, vLLM, llama.cpp, Docker, Python, React — как proof of delivery, не как роль инженера.
+- Астра: анализ процессов и встраивание новой функции в операционную модель продаж, разработки, внедрения и поддержки.
+- IBM Data & AI: delivery AI-oriented инициатив для enterprise-заказчиков, кросс-функциональные команды.
+- CNET + аспирантура по нейросетям: техническая база для разговора с инженерами.
 
 ## Что ослаблять
 
-- Не выглядеть full-time разработчиком или ML engineer: фокус на оркестрации, adoption, эффектах и внедрении.
-- Не перегружать письмо стеком; техническая фактура нужна как доказательство реализуемости, а не как основная роль.
-- Для бизнес-вакансий вроде Паруса снижать R&D-лексикон и поднимать ROI, бюджет, процессы, ИТ/ИБ и CEO-reporting.
+- DWH, Data Lake, MDM, Spark/Flink, platform architecture — это профиль 01.
+- Full-time Python/ML engineer, hands-on model training — не целевой ракурс.
+- P&L и sales-лексика без связи с adoption и внедрением.
 
-## Слова-маркеры
+## Слова-маркеры (из вакансий базы)
 
-Использовать в CV, cover letter и ключевых навыках: AI adoption, Data adoption, AI Business Partner, LLM, RAG, AI agents, Cursor, CLINE, Python, React, Qdrant, vLLM, llama.cpp, Docker, on-prem LLM, GPU resources, API, automation, ROI, adoption metrics, DORA, AI champions, AI ambassadors, change management, workshops, business process analysis, IT/security alignment
+Использовать в CV, cover letter и ключевых навыках: AI adoption, AI IT Partner, AI Business Partner, stakeholder management, cross-functional, pilot, scale, ROI, adoption metrics, AI champions, AI culture, LLM, RAG, AI agents, MCP, AI skills, platform adoption, on-prem LLM, Cursor, change management, workshops, IT/security alignment, engineering workflow, product discovery, roadmap, blockers, dependencies, integration
