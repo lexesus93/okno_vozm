@@ -2,7 +2,7 @@
 
 ## Ключевые навыки для HH
 
-AI adoption, Data adoption, AI Business Partner, AI IT Partner, LLM, RAG, AI agents, MCP, AI skills, Cursor, CLINE, on-prem LLM, ROI, adoption metrics, stakeholder management, change management, AI champions, AI ambassadors, workshops, business process analysis, IT/security alignment, cross-functional coordination, product discovery, pilot to scale, platform adoption, engineering workflow, code review, CI/CD
+AI/Data adoption, AI IT/Business Partner, product discovery, hypothesis testing, pilot to production, adoption metrics, ROI, stakeholder management, change management, AI champions, AI enablement, knowledge sharing, cross-functional orchestration, blocker & dependency management, business process analysis, roadmap development, time-to-market optimization, LLM, RAG, AI agents, MCP, on-prem LLM, platform adoption, IT/security alignment, engineering workflow, CI/CD, process design, enterprise delivery, distributed team management, budget management
 
 ## Требования, которые должен закрывать верх CV
 
@@ -33,4 +33,4 @@ AI adoption, Data adoption, AI Business Partner, AI IT Partner, LLM, RAG, AI age
 
 ## Слова-маркеры (из вакансий базы)
 
-Использовать в CV, cover letter и ключевых навыках: AI adoption, AI IT Partner, AI Business Partner, stakeholder management, cross-functional, pilot, scale, ROI, adoption metrics, AI champions, AI culture, LLM, RAG, AI agents, MCP, AI skills, platform adoption, on-prem LLM, Cursor, change management, workshops, IT/security alignment, engineering workflow, product discovery, roadmap, blockers, dependencies, integration
+Использовать в CV, cover letter и ключевых навыках: AI/Data adoption, AI IT/Business Partner, product discovery, hypothesis testing, pilot to production, adoption metrics, ROI, AI champions, AI enablement, cross-functional orchestration, blocker & dependency management, roadmap development, platform adoption, LLM, RAG, AI agents, MCP, on-prem LLM, IT/security alignment, engineering workflow, stakeholder management, change management, time-to-market optimization, enterprise delivery
